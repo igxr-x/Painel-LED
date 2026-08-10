@@ -83,6 +83,9 @@ PAINEL LED/
 - **Variação mínima** (2 casas) para considerar **estável**.
 - **Tempo da média móvel (ms)** e **taxa de amostragem (Hz)**.
 - **Brilho global** (protege a fonte).
+- **Motor Diesel (sonda invertida)** — acende quando o valor fica abaixo do
+  configurado (ligado por padrão).
+- **LED verde central** em repouso (com cor configurável).
 - Botão **“Enviar e Gravar”** → grava tudo na EEPROM.
 
 ### Aba **Rápido** (dia a dia)
@@ -99,12 +102,20 @@ PAINEL LED/
 
 ## 4. Como a leitura vira imagem
 
-- **Colunas**: cada coluna tem um valor de lambda. A coluna acende quando a
-  média móvel atinge o valor dela → forma uma **barra** (col. 1 = menor λ).
+> **Motor Diesel (padrão):** a sonda trabalha de valores **maiores para
+> menores**, então a lógica é **invertida** — colunas e alerta acendem quando o
+> valor fica **ABAIXO** do configurado. Desmarque *Motor Diesel* na aba
+> Configurações para voltar à lógica normal (acende quando fica acima).
+
+- **Colunas**: cada coluna tem um valor de lambda. Em modo diesel a coluna
+  acende quando a média móvel fica **≤** o valor dela.
+- **LED verde central (2×2)**: fica aceso enquanto o painel está **em repouso**
+  (valor acima do primeiro LED a acender / nenhuma coluna ligada).
 - **Linhas**: a faixa de linhas acesa é escolhida pela **tendência** da média
   móvel (subindo/descendo/estável), conforme configurado.
-- **Alerta**: se a média móvel ≥ *lambda de alerta*, os LEDs de fundo
-  (apagados) acendem estáticos ou piscando.
+- **Alerta**: em modo diesel, se a média móvel **≤** *lambda de alerta*
+  (ex.: 1,33 ou menos), os LEDs de fundo (apagados) acendem estáticos ou
+  piscando — sem apagar o LED verde central.
 
 ---
 
@@ -126,6 +137,10 @@ MAVG ms                      tempo da media movel
 SRATE hz                     taxa de amostragem
 ALARM lambda                 lambda de disparo do alerta
 BRIGHT 0-255                 brilho global
+DIESEL 0|1                   0=normal (>=)  1=diesel/invertido (<=)
+CENTER enable r g b          LED verde central (repouso)
+MAP serp flipx flipy transp  mapeamento fisico da matriz
+TEST 0|1                     padrao de teste p/ ajustar o mapeamento
 SAVE                         grava tudo na EEPROM
 STREAM 0|1                   liga/desliga telemetria
 ```
@@ -133,10 +148,26 @@ STREAM 0|1                   liga/desliga telemetria
 Arduino → App (telemetria contínua, ~10 Hz):
 
 ```
-D <tensao> <lambda> <mediaMovel> <trend> <colunas> <alarme>
-     trend: 1=subindo  0=estavel  -1=descendo
+D <tensao> <lambda> <mediaMovel> <trend> <colMask> <alarme> <central>
+     trend:   1=subindo  0=estavel  -1=descendo
+     colMask: bitmask das 8 colunas acesas (bit0=col1)
+     central: 1 = LED verde central aceso (em repouso)
 ```
 
-> **Ajuste do mapeamento:** o CJMCU-64 costuma ser ligado em *serpentina*
-> (zig-zag). Se a imagem sair espelhada/torta, mude `#define SERPENTINE` em
-> `firmware/src/main.cpp` (true/false) e/ou a função `XY()`.
+## 6. Corrigir LEDs invertidos / zig-zag (mapeamento)
+
+O CJMCU-64 pode ter a fiação em *serpentina* (zig-zag) e a entrada de dados em
+qualquer canto — por isso a imagem pode sair “com uma linha vindo e outra
+indo”. Ajuste **sem recompilar**, pelo app (aba **Configurações → Mapeamento**):
+
+1. Conecte e marque **MODO TESTE**. O painel mostra:
+   - **linha de cima** = vermelha, **coluna da esquerda** = azul,
+   - **canto superior esquerdo** = branco, **canto superior direito** = verde.
+2. Marque/desmarque **Serpentina, Espelhar X, Espelhar Y, Transpor** até:
+   - a linha **vermelha** ficar **reta no topo** e
+   - a coluna **azul** ficar **reta na esquerda** (branco no canto sup. esq.).
+   As mudanças aplicam **ao vivo**.
+3. Desligue o **MODO TESTE** e clique **“Enviar e Gravar”** para salvar.
+
+> Combinações típicas do CJMCU-64: só **Serpentina**; ou **Serpentina + Espelhar
+> Y**; ou **Transpor + Serpentina**. Vá testando — são poucos cliques.

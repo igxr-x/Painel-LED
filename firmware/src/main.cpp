@@ -21,11 +21,13 @@
 // ---------------------------------------------------------------------
 #define LED_PIN      6        // Pino de DADOS (DIN) do painel WS2812B
 #define LAMBDA_PIN   A0       // Entrada analogica da sonda lambda (0-5V)
+#define ALERT_OUT_PIN 10      // Saida do alerta: nivel BAIXO (negativo/GND) quando em alerta
+                             // (repouso = HIGH). Use com rele/buzina via transistor.
 #define NUM_LEDS     64
 #define MATRIX_W     8
 #define MATRIX_H     8
-#define SERPENTINE   true     // CJMCU-64 costuma ser "zig-zag" (serpentina)
 #define ADC_VREF     5.0f     // Tensao de referencia do ADC (5V no Micro)
+// (o tipo de fiacao - serpentina/espelho/transpor - e configuravel pelo app)
 
 CRGB leds[NUM_LEDS];
 
@@ -33,7 +35,7 @@ CRGB leds[NUM_LEDS];
 //  CONFIGURACAO PERSISTENTE (EEPROM)
 // ---------------------------------------------------------------------
 #define CFG_MAGIC    0xA7
-#define CFG_VERSION  1
+#define CFG_VERSION  4
 #define EEPROM_ADDR  0
 #define MAX_WINDOW   200       // maximo de amostras da media movel
 
@@ -50,9 +52,10 @@ struct Config {
   float    colLambda[8];
 
   // Alerta
-  uint16_t alertTime;   // periodo do pisca / tempo do alerta (ms)
+  uint16_t alertTime;   // periodo do pisca (ms)
   uint8_t  alertType;   // 0 = estatico, 1 = piscando
   uint8_t  alertR, alertG, alertB;
+  uint16_t alertHold;   // tempo minimo (ms) que o alerta fica ligado apos disparar
 
   // Calibracao linear tensao<->lambda (2 pontos)
   float    v1, l1;      // ex.: 1.0V -> 0.40 lambda
@@ -69,6 +72,22 @@ struct Config {
 
   float    alarmLambda; // lambda que dispara o alerta
   uint8_t  brightness;  // brilho global (0-255) - protege a fonte
+
+  // Motor diesel: a sonda trabalha de valores MAIORES p/ MENORES.
+  // Em modo diesel a barra e o alerta acendem quando o valor fica ABAIXO
+  // do valor configurado (logica invertida).
+  uint8_t  dieselMode;  // 0 = normal (>=)   1 = diesel/invertido (<=)
+
+  // LED verde central: aceso enquanto o valor estiver "em repouso"
+  // (acima do primeiro LED a acender / nenhuma coluna ligada).
+  uint8_t  centerEnable;
+  uint8_t  centerR, centerG, centerB;
+
+  // Mapeamento fisico da matriz (ajuste ate a imagem sair correta):
+  uint8_t  mapSerp;      // 1 = fiacao serpentina (zig-zag)  0 = progressiva
+  uint8_t  mapFlipX;     // espelha horizontal
+  uint8_t  mapFlipY;     // espelha vertical
+  uint8_t  mapTranspose; // troca linhas <-> colunas (data entra por outro lado)
 };
 
 Config cfg;
@@ -89,7 +108,11 @@ float   mavg        = 0.0f;
 int8_t  trend       = 0;       // -1 desce, 0 estavel, 1 sobe
 float   trendRef    = 0.0f;
 
+bool     alarmActive   = false; // alerta efetivo (condicao OU tempo minimo ligado)
+uint32_t alertHoldUntil = 0;    // millis() ate quando o alerta deve permanecer ligado
+
 bool    streaming   = true;
+bool    testMode    = false;   // padrao de teste p/ ajustar o mapeamento
 
 uint32_t sampleInterval = 100; // ms entre amostras (=1000/sampleRate)
 uint32_t tSample = 0, tFrame = 0, tTelem = 0, tTrend = 0;
@@ -120,6 +143,7 @@ void loadDefaults() {
   cfg.alertTime = 300;
   cfg.alertType = 1;
   cfg.alertR = 255; cfg.alertG = 0; cfg.alertB = 0;
+  cfg.alertHold = 3000;   // fica alertando por no minimo 3s apos disparar
 
   cfg.v1 = 1.0f; cfg.l1 = 0.40f;
   cfg.v2 = 4.0f; cfg.l2 = 1.58f;
@@ -131,8 +155,26 @@ void loadDefaults() {
   cfg.stableThresh = 0.02f;
   cfg.mavgTime     = 500;
   cfg.sampleRate   = 50;
-  cfg.alarmLambda  = 1.40f;
+  cfg.alarmLambda  = 1.33f;
   cfg.brightness   = 40;
+
+  cfg.dieselMode   = 1;            // projeto e para motor diesel
+  cfg.centerEnable = 1;
+  cfg.centerR = 0; cfg.centerG = 255; cfg.centerB = 0;  // verde
+
+  cfg.mapSerp = 1; cfg.mapFlipX = 0; cfg.mapFlipY = 0; cfg.mapTranspose = 0;
+}
+
+// Uma coluna acende conforme o modo (normal x diesel/invertido)
+bool isColLit(uint8_t x) {
+  return cfg.dieselMode ? (mavg <= cfg.colLambda[x])
+                        : (mavg >= cfg.colLambda[x]);
+}
+
+// Condicao de alerta conforme o modo
+bool isAlarm() {
+  return cfg.dieselMode ? (mavg <= cfg.alarmLambda)
+                        : (mavg >= cfg.alarmLambda);
 }
 
 void saveEEPROM() { EEPROM.put(EEPROM_ADDR, cfg); }
@@ -193,11 +235,16 @@ void pushSample(float lam) {
 //  MAPEAMENTO DA MATRIZ  (coluna x, linha y) -> indice do LED
 // ---------------------------------------------------------------------
 uint16_t XY(uint8_t x, uint8_t y) {
+  uint8_t X = x, Y = y;
+  if (cfg.mapTranspose) { uint8_t t = X; X = Y; Y = t; }
+  if (cfg.mapFlipX) X = MATRIX_W - 1 - X;
+  if (cfg.mapFlipY) Y = MATRIX_H - 1 - Y;
+
   uint16_t i;
-  if (SERPENTINE && (y & 0x01)) {
-    i = (uint16_t)y * MATRIX_W + (MATRIX_W - 1 - x); // linha impar invertida
+  if (cfg.mapSerp && (Y & 0x01)) {
+    i = (uint16_t)Y * MATRIX_W + (MATRIX_W - 1 - X); // linha impar invertida
   } else {
-    i = (uint16_t)y * MATRIX_W + x;
+    i = (uint16_t)Y * MATRIX_W + X;
   }
   return i;
 }
@@ -205,7 +252,21 @@ uint16_t XY(uint8_t x, uint8_t y) {
 // ---------------------------------------------------------------------
 //  RENDER
 // ---------------------------------------------------------------------
+// Padrao de teste: linha de cima VERMELHA, coluna da esquerda AZUL,
+// canto (0,0) BRANCO. Se o mapeamento estiver errado a linha/coluna
+// aparece em zig-zag ou no lado errado -> ajuste serp/flip/transpose.
+void renderTest() {
+  digitalWrite(ALERT_OUT_PIN, HIGH);   // saida do alerta em repouso durante o teste
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  for (uint8_t x = 0; x < MATRIX_W; x++) leds[XY(x, 0)] = CRGB::Red;   // linha 1 (topo)
+  for (uint8_t y = 0; y < MATRIX_H; y++) leds[XY(0, y)] = CRGB::Blue;  // coluna 1 (esq)
+  leds[XY(0, 0)] = CRGB::White;                                        // canto sup. esq.
+  leds[XY(7, 0)] = CRGB::Green;                                        // canto sup. dir.
+  FastLED.show();
+}
+
 void render() {
+  if (testMode) { renderTest(); return; }
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   bool on[NUM_LEDS];
   for (uint16_t i = 0; i < NUM_LEDS; i++) on[i] = false;
@@ -215,9 +276,11 @@ void render() {
                    : (trend < 0) ? cfg.rowsFalling
                                  : cfg.rowsStable;
 
-  // Barra: acende a coluna se o lambda atual atingiu o valor dela
+  // Barra: acende a coluna conforme o modo (normal x diesel/invertido)
+  uint8_t colsLit = 0;
   for (uint8_t x = 0; x < 8; x++) {
-    if (mavg >= cfg.colLambda[x]) {
+    if (isColLit(x)) {
+      colsLit++;
       CRGB c(cfg.colR[x], cfg.colG[x], cfg.colB[x]);
       for (uint8_t y = 0; y < 8; y++) {
         if (rowsMask & (1 << y)) {
@@ -229,8 +292,23 @@ void render() {
     }
   }
 
-  // Alerta: acende/pisca os LEDs que estao apagados
-  if (mavg >= cfg.alarmLambda) {
+  // LED verde central (quadrado 2x2): painel em repouso, nenhuma coluna acesa
+  // = valor acima do primeiro LED a acender.
+  if (cfg.centerEnable && colsLit == 0) {
+    CRGB g(cfg.centerR, cfg.centerG, cfg.centerB);
+    const uint8_t cx[2] = {3, 4}, cy[2] = {3, 4};
+    for (uint8_t a = 0; a < 2; a++)
+      for (uint8_t b = 0; b < 2; b++) {
+        uint16_t idx = XY(cx[a], cy[b]);
+        leds[idx] = g;
+        on[idx] = true;
+      }
+  }
+
+  // Alerta: acende/pisca os LEDs apagados e aciona a saida fisica do alerta.
+  // Usa alarmActive (condicao + tempo minimo ligado), atualizado no loop().
+  bool alertOutActive = false;
+  if (alarmActive) {
     bool show = true;
     if (cfg.alertType == 1) {               // piscando
       uint16_t p = cfg.alertTime ? cfg.alertTime : 300;
@@ -241,7 +319,10 @@ void render() {
       for (uint16_t i = 0; i < NUM_LEDS; i++)
         if (!on[i]) leds[i] = a;
     }
+    alertOutActive = show;   // acompanha o pisca do painel
   }
+  // Saida fisica do alerta: LOW = negativo/GND ativo, HIGH = repouso
+  digitalWrite(ALERT_OUT_PIN, alertOutActive ? LOW : HIGH);
 
   FastLED.show();
 }
@@ -262,6 +343,7 @@ void sendConfig() {
   Serial.print(cfg.alertType); Serial.print(',');
   Serial.print(cfg.alertR); Serial.print(','); Serial.print(cfg.alertG);
   Serial.print(','); Serial.print(cfg.alertB);
+  Serial.print(','); Serial.print(cfg.alertHold);
   Serial.print(F(" CAL=")); Serial.print(cfg.v1, 3); Serial.print(',');
   Serial.print(cfg.l1, 3); Serial.print(','); Serial.print(cfg.v2, 3);
   Serial.print(','); Serial.print(cfg.l2, 3);
@@ -272,6 +354,13 @@ void sendConfig() {
   Serial.print(F(" SRATE=")); Serial.print(cfg.sampleRate);
   Serial.print(F(" ALARM=")); Serial.print(cfg.alarmLambda, 3);
   Serial.print(F(" BRIGHT=")); Serial.print(cfg.brightness);
+  Serial.print(F(" DIESEL=")); Serial.print(cfg.dieselMode);
+  Serial.print(F(" CENTER=")); Serial.print(cfg.centerEnable); Serial.print(',');
+  Serial.print(cfg.centerR); Serial.print(','); Serial.print(cfg.centerG);
+  Serial.print(','); Serial.print(cfg.centerB);
+  Serial.print(F(" MAP=")); Serial.print(cfg.mapSerp); Serial.print(',');
+  Serial.print(cfg.mapFlipX); Serial.print(','); Serial.print(cfg.mapFlipY);
+  Serial.print(','); Serial.print(cfg.mapTranspose);
   Serial.println();
 }
 
@@ -299,9 +388,11 @@ void handleLine(char *line) {
     if (i >= 0 && i < 8) cfg.colLambda[i] = v;
     Serial.println(F("OK COLLAMBDA"));
   }
-  else if (!strcmp(cmd, "ALERT")) {              // ALERT tempo tipo
+  else if (!strcmp(cmd, "ALERT")) {              // ALERT periodo tipo [hold]
     cfg.alertTime = atoi(strtok(NULL, " "));
     cfg.alertType = atoi(strtok(NULL, " "));
+    char *h = strtok(NULL, " ");
+    if (h) cfg.alertHold = atoi(h);             // opcional (compat. com versoes antigas)
     Serial.println(F("OK ALERT"));
   }
   else if (!strcmp(cmd, "ALERTCOLOR")) {         // ALERTCOLOR r g b
@@ -346,6 +437,28 @@ void handleLine(char *line) {
     FastLED.setBrightness(cfg.brightness);
     Serial.println(F("OK BRIGHT"));
   }
+  else if (!strcmp(cmd, "DIESEL")) {             // DIESEL 0|1
+    cfg.dieselMode = atoi(strtok(NULL, " ")) ? 1 : 0;
+    Serial.println(F("OK DIESEL"));
+  }
+  else if (!strcmp(cmd, "CENTER")) {             // CENTER enable r g b
+    cfg.centerEnable = atoi(strtok(NULL, " ")) ? 1 : 0;
+    cfg.centerR = atoi(strtok(NULL, " "));
+    cfg.centerG = atoi(strtok(NULL, " "));
+    cfg.centerB = atoi(strtok(NULL, " "));
+    Serial.println(F("OK CENTER"));
+  }
+  else if (!strcmp(cmd, "MAP")) {                // MAP serp flipx flipy transpose
+    cfg.mapSerp      = atoi(strtok(NULL, " ")) ? 1 : 0;
+    cfg.mapFlipX     = atoi(strtok(NULL, " ")) ? 1 : 0;
+    cfg.mapFlipY     = atoi(strtok(NULL, " ")) ? 1 : 0;
+    cfg.mapTranspose = atoi(strtok(NULL, " ")) ? 1 : 0;
+    Serial.println(F("OK MAP"));
+  }
+  else if (!strcmp(cmd, "TEST")) {               // TEST 0|1
+    testMode = atoi(strtok(NULL, " ")) ? true : false;
+    Serial.println(F("OK TEST"));
+  }
   else {
     Serial.print(F("ERR ")); Serial.println(cmd);
   }
@@ -365,16 +478,18 @@ void handleSerial() {
 }
 
 void sendTelemetry() {
-  // D <tensao> <lambda> <mavg> <trend> <colunas> <alarme>
-  uint8_t cols = 0;
-  for (uint8_t x = 0; x < 8; x++) if (mavg >= cfg.colLambda[x]) cols++;
+  // D <tensao> <lambda> <mavg> <trend> <colMask> <alarme> <central>
+  uint8_t colMask = 0;
+  for (uint8_t x = 0; x < 8; x++) if (isColLit(x)) colMask |= (1 << x);
+  uint8_t center = (cfg.centerEnable && colMask == 0) ? 1 : 0;
   Serial.print(F("D "));
   Serial.print(lastVoltage, 3); Serial.print(' ');
   Serial.print(lastLambda, 3);  Serial.print(' ');
   Serial.print(mavg, 3);        Serial.print(' ');
   Serial.print(trend);          Serial.print(' ');
-  Serial.print(cols);           Serial.print(' ');
-  Serial.println(mavg >= cfg.alarmLambda ? 1 : 0);
+  Serial.print(colMask);        Serial.print(' ');
+  Serial.print(alarmActive ? 1 : 0); Serial.print(' ');
+  Serial.println(center);
 }
 
 // ---------------------------------------------------------------------
@@ -383,6 +498,8 @@ void sendTelemetry() {
 void setup() {
   Serial.begin(115200);
   analogReference(DEFAULT);
+  pinMode(ALERT_OUT_PIN, OUTPUT);
+  digitalWrite(ALERT_OUT_PIN, HIGH);   // repouso (sem alerta)
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   loadEEPROM();
   applyConfig();
@@ -409,6 +526,12 @@ void loop() {
     else                            trend =  0;
     trendRef = mavg;
   }
+
+  // Alerta com tempo minimo ligado (hold): ao disparar, estende o prazo; o alerta
+  // so desliga depois que a condicao cessou E o prazo minimo passou.
+  bool rawAlarm = isAlarm();
+  if (rawAlarm) alertHoldUntil = now + cfg.alertHold;
+  alarmActive = rawAlarm || ((int32_t)(alertHoldUntil - now) > 0);
 
   if (now - tFrame >= FRAME_MS) {
     tFrame = now;

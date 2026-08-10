@@ -16,6 +16,7 @@ Requisitos:  pip install pyserial      (Tkinter ja vem com o Python)
 import queue
 import threading
 import time
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, colorchooser, messagebox
 
@@ -25,6 +26,7 @@ import serial.tools.list_ports
 BAUD = 115200
 NUM_COLS = 8
 NUM_ROWS = 8
+ADC_VREF = 5.0   # tensao de referencia do ADC (5V no Arduino Micro) - usado no simulador
 
 # VID/PID que indicam um Arduino (prioridade na deteccao automatica)
 # Micro/genuinos (USB nativo) + chips seriais comuns das Nano (CH340/FTDI/CP210x)
@@ -138,12 +140,16 @@ class App(tk.Tk):
         self._build_toolbar()
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=8, pady=4)
-        self.tab_cfg = ttk.Frame(nb)
         self.tab_fast = ttk.Frame(nb)
-        nb.add(self.tab_cfg, text="  Configuracoes  ")
+        self.tab_cfg = ttk.Frame(nb)
+        self.tab_sim = ttk.Frame(nb)
         nb.add(self.tab_fast, text="  Rapido  ")
+        nb.add(self.tab_cfg, text="  Configuracoes  ")
+        nb.add(self.tab_sim, text="  Simulador  ")
+        # cfg/fast criam os widgets/variaveis usados pelo simulador -> construir antes
         self._build_cfg_tab()
         self._build_fast_tab()
+        self._build_sim_tab()
 
         self.after(60, self._poll_rx)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -218,7 +224,7 @@ class App(tk.Tk):
         # Alerta
         g2 = ttk.LabelFrame(f, text="Alerta")
         g2.pack(fill="x", padx=8, pady=6)
-        ttk.Label(g2, text="Tempo/periodo (ms):").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(g2, text="Periodo do pisca (ms):").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.alert_time = tk.StringVar(value="300")
         ttk.Entry(g2, textvariable=self.alert_time, width=8).grid(row=0, column=1, padx=4)
         ttk.Label(g2, text="Tipo:").grid(row=0, column=2, sticky="e", padx=4)
@@ -230,6 +236,11 @@ class App(tk.Tk):
         self.alert_btn = tk.Button(g2, text="   ", width=4, bg=self.alert_color,
                                    command=self.pick_alert_color)
         self.alert_btn.grid(row=0, column=5, padx=4)
+        ttk.Label(g2, text="Tempo minimo ligado (ms):").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.alert_hold = tk.StringVar(value="3000")
+        ttk.Entry(g2, textvariable=self.alert_hold, width=8).grid(row=1, column=1, padx=4)
+        ttk.Label(g2, text="(uma vez disparado, fica alertando por no minimo esse tempo)",
+                  foreground="#666").grid(row=1, column=2, columnspan=4, sticky="w", padx=4)
 
         # Calibracao tensao/lambda
         g3 = ttk.LabelFrame(f, text="Calibracao linear  Tensao <-> Lambda (2 pontos)")
@@ -245,15 +256,23 @@ class App(tk.Tk):
         ttk.Label(g3, text="= Lambda:").grid(row=1, column=2, sticky="e", padx=4)
         ttk.Entry(g3, textvariable=self.l2, width=8).grid(row=1, column=3, padx=4)
 
-        # Linhas por tendencia
-        g4 = ttk.LabelFrame(f, text="Linhas acesas por tendencia da media movel  (1=topo ... 8=base)")
+        # Linhas por tendencia  (visualizacao em coluna: topo -> base)
+        g4 = ttk.LabelFrame(f, text="Linhas acesas por tendencia da media movel  (topo -> base)")
         g4.pack(fill="x", padx=8, pady=6)
-        labels = [("Subindo", "rise"), ("Descendo", "fall"), ("Estavel", "stab")]
-        for r, (txt, key) in enumerate(labels):
-            ttk.Label(g4, text=txt + ":").grid(row=r, column=0, sticky="e", padx=4, pady=3)
-            for y in range(NUM_ROWS):
+        trends = [("Subindo", "rise"), ("Descendo", "fall"), ("Estavel", "stab")]
+        # cabecalho: uma coluna por tendencia
+        ttk.Label(g4, text="Linha").grid(row=0, column=0, padx=6, pady=(4, 2))
+        for c, (txt, _key) in enumerate(trends):
+            ttk.Label(g4, text=txt, font=("Segoe UI", 9, "bold")).grid(
+                row=0, column=1 + c, padx=12, pady=(4, 2))
+        # 8 linhas empilhadas verticalmente (1 = topo ... 8 = base)
+        for y in range(NUM_ROWS):
+            tag = "  (topo)" if y == 0 else ("  (base)" if y == NUM_ROWS - 1 else "")
+            ttk.Label(g4, text="{}{}".format(y + 1, tag)).grid(
+                row=1 + y, column=0, sticky="e", padx=6, pady=1)
+            for c, (_txt, key) in enumerate(trends):
                 v = tk.IntVar()
-                ttk.Checkbutton(g4, variable=v).grid(row=r, column=1 + y, padx=1)
+                ttk.Checkbutton(g4, variable=v).grid(row=1 + y, column=1 + c, padx=12, pady=1)
                 self.rows_vars[key].append(v)
         # defaults
         for y in (0, 1, 2): self.rows_vars["rise"][y].set(1)
@@ -281,6 +300,46 @@ class App(tk.Tk):
                   orient="horizontal", length=300).pack(side="left", padx=8, pady=6)
         ttk.Label(g6, textvariable=self.brightness).pack(side="left")
 
+        # Modo diesel (sonda invertida) + LED verde central
+        g7 = ttk.LabelFrame(f, text="Tipo de motor e LED central")
+        g7.pack(fill="x", padx=8, pady=6)
+        self.diesel_mode = tk.IntVar(value=1)
+        ttk.Checkbutton(g7, variable=self.diesel_mode,
+                        text="Motor Diesel (sonda invertida: acende quando o valor "
+                             "fica ABAIXO do configurado)").grid(
+            row=0, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+        self.center_enable = tk.IntVar(value=1)
+        ttk.Checkbutton(g7, variable=self.center_enable,
+                        text="LED verde central quando em repouso (acima do 1o LED)").grid(
+            row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        ttk.Label(g7, text="Cor central:").grid(row=1, column=3, sticky="e", padx=4)
+        self.center_color = "#00ff00"
+        self.center_btn = tk.Button(g7, text="   ", width=4, bg=self.center_color,
+                                    command=self.pick_center_color)
+        self.center_btn.grid(row=1, column=4, padx=4)
+
+        # Mapeamento fisico da matriz (corrige LEDs "invertidos"/zig-zag)
+        g8 = ttk.LabelFrame(f, text="Mapeamento do painel  (corrige LEDs invertidos / zig-zag)")
+        g8.pack(fill="x", padx=8, pady=6)
+        self.map_serp = tk.IntVar(value=1)
+        self.map_flipx = tk.IntVar(value=0)
+        self.map_flipy = tk.IntVar(value=0)
+        self.map_transp = tk.IntVar(value=0)
+        opts = [("Serpentina (zig-zag)", self.map_serp),
+                ("Espelhar X", self.map_flipx),
+                ("Espelhar Y", self.map_flipy),
+                ("Transpor (linha/coluna)", self.map_transp)]
+        for c, (txt, var) in enumerate(opts):
+            ttk.Checkbutton(g8, text=txt, variable=var,
+                            command=self.send_map).grid(row=0, column=c, sticky="w", padx=6, pady=4)
+        self.test_on = tk.IntVar(value=0)
+        ttk.Checkbutton(g8, text="MODO TESTE (topo=vermelho, esquerda=azul, canto=branco)",
+                        variable=self.test_on, command=self.toggle_test).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+        ttk.Label(g8, text="Ligue o teste e marque as opcoes acima ate a linha "
+                           "vermelha ficar reta no TOPO e a azul reta na ESQUERDA.",
+                  foreground="#666").grid(row=2, column=0, columnspan=4, sticky="w", padx=6)
+
         ttk.Button(f, text="Enviar e Gravar configuracoes (SAVE)",
                    command=self.send_all_static).pack(pady=10)
 
@@ -303,8 +362,9 @@ class App(tk.Tk):
 
         g2 = ttk.LabelFrame(f, text="Alerta rapido")
         g2.pack(fill="x", padx=8, pady=6)
-        ttk.Label(g2, text="Lambda que dispara o alerta:").grid(row=0, column=0, sticky="e", padx=4, pady=6)
-        self.alarm_lambda = tk.StringVar(value="1.40")
+        ttk.Label(g2, text="Lambda de alerta (diesel: dispara com valor ABAIXO):").grid(
+            row=0, column=0, sticky="e", padx=4, pady=6)
+        self.alarm_lambda = tk.StringVar(value="1.33")
         ttk.Entry(g2, textvariable=self.alarm_lambda, width=8).grid(row=0, column=1, padx=4)
         ttk.Button(g2, text="Enviar ajustes rapidos",
                    command=self.send_fast).grid(row=0, column=2, padx=16)
@@ -345,6 +405,155 @@ class App(tk.Tk):
         self.logbox = tk.Text(g5, height=5, bg="#0b0b0b", fg="#0f0")
         self.logbox.pack(fill="x", padx=4, pady=4)
 
+    # ---------------- ABA SIMULADOR ----------------
+    def _build_sim_tab(self):
+        f = self.tab_sim
+
+        top = ttk.LabelFrame(f, text="Simulador da sonda  (usa as configuracoes atuais + media movel)")
+        top.pack(fill="x", padx=8, pady=6)
+
+        ttk.Label(top, text="Tensao da sonda (V):").grid(row=0, column=0, sticky="e", padx=6, pady=8)
+        self.sim_volt = tk.DoubleVar(value=1.0)
+        ttk.Scale(top, from_=0.0, to=ADC_VREF, variable=self.sim_volt, orient="horizontal",
+                  length=380).grid(row=0, column=1, columnspan=3, padx=6, sticky="w")
+        ttk.Button(top, text="Zerar media movel", command=self._sim_reset).grid(row=0, column=4, padx=8)
+
+        big = ("Segoe UI", 15, "bold")
+        self.sim_lbl_volt = tk.StringVar(value="--")
+        self.sim_lbl_lam = tk.StringVar(value="--")
+        self.sim_lbl_mavg = tk.StringVar(value="--")
+        self.sim_lbl_trend = tk.StringVar(value="--")
+        self.sim_lbl_alarm = tk.StringVar(value="--")
+        ttk.Label(top, text="Tensao:").grid(row=1, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(top, textvariable=self.sim_lbl_volt, font=big, foreground="#06c").grid(row=1, column=1, sticky="w")
+        ttk.Label(top, text="V").grid(row=1, column=2, sticky="w")
+        ttk.Label(top, text="Lambda (instantaneo):").grid(row=1, column=3, sticky="e", padx=6)
+        ttk.Label(top, textvariable=self.sim_lbl_lam, font=big, foreground="#080").grid(row=1, column=4, sticky="w")
+        ttk.Label(top, text="Media movel:").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(top, textvariable=self.sim_lbl_mavg, font=big, foreground="#c60").grid(row=2, column=1, sticky="w")
+        ttk.Label(top, text="Tendencia:").grid(row=2, column=3, sticky="e", padx=6)
+        ttk.Label(top, textvariable=self.sim_lbl_trend, font=big).grid(row=2, column=4, sticky="w")
+        ttk.Label(top, text="Alerta:").grid(row=3, column=0, sticky="e", padx=6, pady=4)
+        ttk.Label(top, textvariable=self.sim_lbl_alarm, font=big, foreground="#b00").grid(row=3, column=1, sticky="w")
+        ttk.Label(top, text="(a barra/alerta/tendencia usam a MEDIA MOVEL, igual ao painel real)",
+                  foreground="#666").grid(row=4, column=0, columnspan=5, sticky="w", padx=6, pady=(2, 4))
+
+        pf = ttk.LabelFrame(f, text="Previa do painel simulado")
+        pf.pack(fill="both", expand=True, padx=8, pady=6)
+        self.sim_canvas = tk.Canvas(pf, width=8 * 34, height=8 * 34, bg="#111", highlightthickness=0)
+        self.sim_canvas.pack(padx=8, pady=8)
+        self.sim_cells = [[None] * 8 for _ in range(8)]
+        for y in range(8):
+            for x in range(8):
+                self.sim_cells[y][x] = self.sim_canvas.create_oval(
+                    x * 34 + 4, y * 34 + 4, x * 34 + 30, y * 34 + 30,
+                    fill="#222", outline="#333")
+
+        # estado da simulacao da media movel (buffer circular, como o firmware)
+        self._sim_ring = deque()
+        self._sim_windowN = 0
+        self._sim_mavg = None
+        self._sim_trend = 0
+        self._sim_trend_ref = None
+        self._sim_last = None       # instante do ultimo tick (ms)
+        self._sim_last_trend = None # instante da ultima avaliacao de tendencia (ms)
+        self._sim_hold_until = 0.0  # ms ate quando o alerta fica ligado (tempo minimo)
+        self.after(40, self._sim_tick)
+
+    def _sim_reset(self):
+        """Zera o buffer da media movel (a media 'salta' para o valor atual)."""
+        self._sim_ring.clear()
+        self._sim_mavg = None
+        self._sim_trend = 0
+        self._sim_trend_ref = None
+        self._sim_hold_until = 0.0
+
+    def _sim_float(self, var, default=0.0):
+        """Le uma StringVar/DoubleVar como float, tolerando virgula e campo vazio."""
+        try:
+            return float(str(var.get()).strip().replace(",", "."))
+        except (ValueError, AttributeError):
+            return default
+
+    def _sim_lambda(self, v):
+        """Converte tensao -> lambda pela reta de calibracao (igual ao firmware)."""
+        v1, l1 = self._sim_float(self.v1, 1.0), self._sim_float(self.l1, 0.40)
+        v2, l2 = self._sim_float(self.v2, 4.0), self._sim_float(self.l2, 1.58)
+        dv = v2 - v1
+        if abs(dv) < 1e-6:
+            return l1
+        return l1 + (v - v1) * (l2 - l1) / dv
+
+    def _sim_tick(self):
+        """Avanca a simulacao: alimenta a media movel com o valor atual do slider
+        conforme a taxa de amostragem, recalcula media/tendencia e redesenha."""
+        now = time.perf_counter() * 1000.0
+        if self._sim_last is None:
+            self._sim_last = now
+            self._sim_last_trend = now
+
+        # parametros de amostragem/media (mesma matematica do applyConfig do firmware)
+        srate = min(max(self._sim_float(self.sample_rate, 50), 1.0), 500.0)
+        sample_interval = max(1000.0 / srate, 2.0)
+        windowN = int(self._sim_float(self.mavg_time, 500) / sample_interval)
+        windowN = min(max(windowN, 1), 200)   # MAX_WINDOW = 200 no firmware
+        if windowN != self._sim_windowN:
+            self._sim_windowN = windowN
+            self._sim_ring = deque(self._sim_ring, maxlen=windowN)
+
+        lam = self._sim_lambda(self._sim_float(self.sim_volt, 0.0))
+
+        # empurra as amostras que "caberiam" no tempo decorrido desde o ultimo tick
+        n = int((now - self._sim_last) / sample_interval)
+        if n > windowN:
+            n = windowN            # nao adianta empurrar mais que a janela inteira
+        for _ in range(n):
+            self._sim_ring.append(lam)
+        if n:
+            self._sim_last += n * sample_interval
+
+        self._sim_mavg = (sum(self._sim_ring) / len(self._sim_ring)) if self._sim_ring else lam
+
+        # tendencia a cada 250 ms (TREND_MS), comparando com o limiar de estabilidade
+        if now - self._sim_last_trend >= 250:
+            self._sim_last_trend = now
+            thr = self._sim_float(self.stable_thresh, 0.02)
+            ref = self._sim_trend_ref if self._sim_trend_ref is not None else self._sim_mavg
+            d = self._sim_mavg - ref
+            self._sim_trend = 1 if d > thr else (-1 if d < -thr else 0)
+            self._sim_trend_ref = self._sim_mavg
+
+        self._sim_render(lam, self._sim_mavg, self._sim_trend)
+        self.after(40, self._sim_tick)
+
+    def _sim_render(self, lam, mavg, trend):
+        """Desenha o painel simulado a partir da media movel (igual ao firmware)."""
+        diesel = self.diesel_mode.get()
+        colmask = 0
+        for x in range(NUM_COLS):
+            cl = self._sim_float(self.col_lambda_vars[x], None)
+            if cl is None:
+                continue
+            lit = (mavg <= cl) if diesel else (mavg >= cl)
+            if lit:
+                colmask |= (1 << x)
+
+        al = self._sim_float(self.alarm_lambda, None)
+        raw_alarm = False if al is None else ((mavg <= al) if diesel else (mavg >= al))
+        # tempo minimo ligado (hold): mantem o alerta ativo apos disparar
+        now = time.perf_counter() * 1000.0
+        if raw_alarm:
+            self._sim_hold_until = now + self._sim_float(self.alert_hold, 0.0)
+        alarm = raw_alarm or (now < self._sim_hold_until)
+        center = 1 if (self.center_enable.get() and colmask == 0) else 0
+
+        self.sim_lbl_volt.set("{:.3f}".format(self._sim_float(self.sim_volt, 0.0)))
+        self.sim_lbl_lam.set("{:.3f}".format(lam))
+        self.sim_lbl_mavg.set("{:.3f}".format(mavg))
+        self.sim_lbl_trend.set({1: "SUBINDO", -1: "DESCENDO", 0: "ESTAVEL"}[trend])
+        self.sim_lbl_alarm.set("ATIVO" if alarm else "ok")
+        self._render_cells(self.sim_canvas, self.sim_cells, colmask, trend, int(alarm), center)
+
     # ---------------- helpers de cor ----------------
     def pick_color(self, i):
         c = colorchooser.askcolor(color=self.col_colors[i], title="Cor da coluna {}".format(i + 1))
@@ -357,6 +566,12 @@ class App(tk.Tk):
         if c and c[1]:
             self.alert_color = c[1]
             self.alert_btn.config(bg=c[1])
+
+    def pick_center_color(self):
+        c = colorchooser.askcolor(color=self.center_color, title="Cor do LED central")
+        if c and c[1]:
+            self.center_color = c[1]
+            self.center_btn.config(bg=c[1])
 
     @staticmethod
     def hex_to_rgb(h):
@@ -395,6 +610,18 @@ class App(tk.Tk):
                 m |= (1 << y)
         return m
 
+    # ---------------- mapeamento / teste ----------------
+    def send_map(self):
+        """Envia o mapeamento ao vivo (sem gravar), p/ ajuste imediato."""
+        if self.link.is_open():
+            self.link.send("MAP {} {} {} {}".format(
+                self.map_serp.get(), self.map_flipx.get(),
+                self.map_flipy.get(), self.map_transp.get()))
+
+    def toggle_test(self):
+        if self.link.is_open():
+            self.link.send("TEST {}".format(self.test_on.get()))
+
     # ---------------- envio ----------------
     def _f(self, var):
         return float(var.get().strip().replace(",", "."))
@@ -409,7 +636,8 @@ class App(tk.Tk):
                 self.link.send("COLOR {} {} {} {}".format(i, r, g, b))
             ar, ag, ab = self.hex_to_rgb(self.alert_color)
             atype = 1 if self.alert_type.get() == "Piscando" else 0
-            self.link.send("ALERT {} {}".format(int(self._f(self.alert_time)), atype))
+            self.link.send("ALERT {} {} {}".format(int(self._f(self.alert_time)), atype,
+                                                    int(self._f(self.alert_hold))))
             self.link.send("ALERTCOLOR {} {} {}".format(ar, ag, ab))
             self.link.send("CALIB {} {} {} {}".format(self._f(self.v1), self._f(self.l1),
                                                       self._f(self.v2), self._f(self.l2)))
@@ -420,6 +648,11 @@ class App(tk.Tk):
             self.link.send("MAVG {}".format(int(self._f(self.mavg_time))))
             self.link.send("SRATE {}".format(int(self._f(self.sample_rate))))
             self.link.send("BRIGHT {}".format(int(self.brightness.get())))
+            self.link.send("DIESEL {}".format(self.diesel_mode.get()))
+            cr, cg, cb = self.hex_to_rgb(self.center_color)
+            self.link.send("CENTER {} {} {} {}".format(self.center_enable.get(), cr, cg, cb))
+            self.link.send("MAP {} {} {} {}".format(self.map_serp.get(), self.map_flipx.get(),
+                                                    self.map_flipy.get(), self.map_transp.get()))
             self.link.send("SAVE")
             self._log(">> Configuracoes estaticas enviadas e gravadas.")
         except ValueError:
@@ -453,14 +686,15 @@ class App(tk.Tk):
     def _handle_line(self, line):
         if line.startswith("D "):
             p = line.split()
-            if len(p) >= 7:
+            if len(p) >= 8:
                 volt, lam, mavg = p[1], p[2], p[3]
-                trend, cols, alarm = int(p[4]), int(p[5]), int(p[6])
+                trend = int(p[4])
+                colmask, alarm, center = int(p[5]), int(p[6]), int(p[7])
                 self.lbl_volt.set(volt)
                 self.lbl_lam.set(lam)
                 self.lbl_mavg.set(mavg)
                 self.lbl_trend.set({1: "SUBINDO", -1: "DESCENDO", 0: "ESTAVEL"}[trend])
-                self._update_preview(cols, trend, alarm)
+                self._update_preview(colmask, trend, alarm, center)
             return
         if line.startswith("CFG"):
             self._parse_cfg(line)
@@ -481,11 +715,14 @@ class App(tk.Tk):
                     self.color_btns[i].config(bg=self.col_colors[i])
                     self.col_lambda_vars[i].set("{:.2f}".format(float(lam)))
                 elif k == "ALERT":
-                    t_, ty, r, g, b = val.split(",")
+                    parts = val.split(",")
+                    t_, ty, r, g, b = parts[:5]
                     self.alert_time.set(t_)
                     self.alert_type.set("Piscando" if ty == "1" else "Estatico")
                     self.alert_color = "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
                     self.alert_btn.config(bg=self.alert_color)
+                    if len(parts) >= 6:
+                        self.alert_hold.set(parts[5])
                 elif k == "CAL":
                     v1, l1, v2, l2 = val.split(",")
                     self.v1.set(v1); self.l1.set(l1); self.v2.set(v2); self.l2.set(l2)
@@ -505,19 +742,41 @@ class App(tk.Tk):
                     self.alarm_lambda.set(val)
                 elif k == "BRIGHT":
                     self.brightness.set(int(val))
+                elif k == "DIESEL":
+                    self.diesel_mode.set(int(val))
+                elif k == "CENTER":
+                    en, r, g, b = val.split(",")
+                    self.center_enable.set(int(en))
+                    self.center_color = "#{:02x}{:02x}{:02x}".format(int(r), int(g), int(b))
+                    self.center_btn.config(bg=self.center_color)
+                elif k == "MAP":
+                    s, fx, fy, tr = (int(x) for x in val.split(","))
+                    self.map_serp.set(s); self.map_flipx.set(fx)
+                    self.map_flipy.set(fy); self.map_transp.set(tr)
             except Exception:
                 pass
         self._log(">> Configuracao lida do Arduino.")
 
-    def _update_preview(self, cols, trend, alarm):
+    def _render_cells(self, canvas, cells, colmask, trend, alarm, center):
+        """Pinta uma matriz 8x8 (canvas + cells) com a mesma logica do firmware."""
         rows = self.rows_mask({1: "rise", -1: "fall", 0: "stab"}[trend])
+        # quadrado verde central 2x2 quando em repouso
+        center_cells = {(3, 3), (3, 4), (4, 3), (4, 4)} if center else set()
         for y in range(8):
             for x in range(8):
-                lit = (x < cols) and (rows & (1 << y))
-                color = self.col_colors[x] if lit else "#1a1a1a"
-                if not lit and alarm:
+                lit = bool(colmask & (1 << x)) and (rows & (1 << y))
+                if lit:
+                    color = self.col_colors[x]
+                elif (x, y) in center_cells:
+                    color = self.center_color
+                elif alarm:
                     color = self.alert_color
-                self.canvas.itemconfig(self.cells[y][x], fill=color)
+                else:
+                    color = "#1a1a1a"
+                canvas.itemconfig(cells[y][x], fill=color)
+
+    def _update_preview(self, colmask, trend, alarm, center):
+        self._render_cells(self.canvas, self.cells, colmask, trend, alarm, center)
 
     def _log(self, txt):
         self.logbox.insert("end", txt + "\n")
