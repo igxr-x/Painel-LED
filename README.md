@@ -34,6 +34,17 @@ PAINEL LED/
 | Sinal da sonda lambda      | **A0**        | Saída 0–5 V do condicionador/wideband |
 | GND da sonda               | **GND**       | Terra comum com o Arduino |
 
+| Sinal                      | Arduino Micro | Destino                   |
+|----------------------------|:-------------:|---------------------------|
+| Saída de alerta (negativo/GND) | **D10**   | Relé / buzina via transistor |
+
+### Saída de alerta (D10)
+- O **negativo (GND) do alerta sai no pino D10**.
+- **Repouso:** D10 fica em **HIGH**. **Em alerta:** D10 vai para **LOW**
+  (nível baixo = negativo/GND) — lógica **invertida**.
+- Não acione relé/buzina direto pelo pino: use um **transistor** (o pino do
+  Arduino não deve chavear cargas indutivas diretamente).
+
 ### Notas de energia (importante)
 - 64 LEDs WS2812B podem puxar **até ~3,8 A** em branco pleno. Aqui só alguns
   acendem e o **brilho é limitado** (padrão 40/255), mas ainda assim **alimente
