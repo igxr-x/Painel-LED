@@ -168,6 +168,9 @@ class App(tk.Tk):
         self.btn_conn.pack(side="left", padx=6)
         self.status = ttk.Label(bar, text="Desconectado", foreground="#b00")
         self.status.pack(side="left", padx=6)
+        # Botao de salvar as configuracoes junto da conexao (sempre visivel)
+        ttk.Button(bar, text="Enviar e Gravar configuracoes (SAVE)",
+                   command=self.send_all_static).pack(side="right", padx=6)
 
     def refresh_ports(self):
         self.ports = SerialLink.list_ports()
@@ -209,7 +212,26 @@ class App(tk.Tk):
 
     # ---------------- ABA CONFIGURACOES ----------------
     def _build_cfg_tab(self):
-        f = self.tab_cfg
+        # Area rolavel: canvas + scrollbar para nao cortar o botao SALVAR
+        outer = self.tab_cfg
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        f = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=f, anchor="nw")
+        f.bind("<Configure>",
+               lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        # so ativa a roda do mouse quando o cursor esta sobre esta aba
+        f.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        f.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
         # Cores das colunas
         g1 = ttk.LabelFrame(f, text="Cor de cada coluna")
@@ -259,7 +281,7 @@ class App(tk.Tk):
         # Linhas por tendencia  (visualizacao em coluna: topo -> base)
         g4 = ttk.LabelFrame(f, text="Linhas acesas por tendencia da media movel  (topo -> base)")
         g4.pack(fill="x", padx=8, pady=6)
-        trends = [("Subindo", "rise"), ("Descendo", "fall"), ("Estavel", "stab")]
+        trends = [("Subindo", "rise"), ("Estavel", "stab"), ("Descendo", "fall")]
         # cabecalho: uma coluna por tendencia
         ttk.Label(g4, text="Linha").grid(row=0, column=0, padx=6, pady=(4, 2))
         for c, (txt, _key) in enumerate(trends):
@@ -339,9 +361,6 @@ class App(tk.Tk):
         ttk.Label(g8, text="Ligue o teste e marque as opcoes acima ate a linha "
                            "vermelha ficar reta no TOPO e a azul reta na ESQUERDA.",
                   foreground="#666").grid(row=2, column=0, columnspan=4, sticky="w", padx=6)
-
-        ttk.Button(f, text="Enviar e Gravar configuracoes (SAVE)",
-                   command=self.send_all_static).pack(pady=10)
 
     # ---------------- ABA RAPIDO ----------------
     def _build_fast_tab(self):
