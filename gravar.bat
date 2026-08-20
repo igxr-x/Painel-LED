@@ -24,8 +24,23 @@ if %ERRORLEVEL%==0 ( set "PIO=platformio" & goto :run )
 python -m platformio --version >nul 2>nul
 if %ERRORLEVEL%==0 ( set "PIO=python -m platformio" & goto :run )
 
-echo [ERRO] PlatformIO nao encontrado.
-echo   Instale com:  pip install platformio
+REM ---- PlatformIO nao encontrado: tenta instalar via pip automaticamente ----
+echo [AVISO] PlatformIO nao encontrado. Tentando instalar via pip...
+echo.
+python --version >nul 2>nul
+if not %ERRORLEVEL%==0 (
+    echo [ERRO] Python nao encontrado neste computador.
+    echo   Instale o Python 3 (marque "Add Python to PATH"):  https://www.python.org/downloads/
+    echo   Depois rode este gravar.bat novamente.
+    goto :end
+)
+python -m pip install --upgrade pip
+python -m pip install --user platformio
+python -m platformio --version >nul 2>nul
+if %ERRORLEVEL%==0 ( set "PIO=python -m platformio" & goto :run )
+
+echo [ERRO] Nao consegui instalar/localizar o PlatformIO automaticamente.
+echo   Tente manualmente:  python -m pip install platformio
 echo   ou instale a extensao PlatformIO IDE no VS Code.
 goto :end
 
