@@ -35,7 +35,7 @@ CRGB leds[NUM_LEDS];
 //  CONFIGURACAO PERSISTENTE (EEPROM)
 // ---------------------------------------------------------------------
 #define CFG_MAGIC    0xA7
-#define CFG_VERSION  5
+#define CFG_VERSION  6
 #define EEPROM_ADDR  0
 #define MAX_WINDOW   200       // maximo de amostras da media movel
 
@@ -83,6 +83,13 @@ struct Config {
   // (acima do primeiro LED a acender / nenhuma coluna ligada).
   uint8_t  centerEnable;
   uint8_t  centerR, centerG, centerB;
+
+  // Indicador central "abaixo do limite": mesmo quadrado 2x2 central, mas
+  // acende (com cor propria) quando a media movel cai ABAIXO de lowLambda.
+  // Espelha o LED central de repouso para o extremo oposto da escala.
+  uint8_t  lowEnable;
+  float    lowLambda;
+  uint8_t  lowR, lowG, lowB;
 
   // Mapeamento fisico da matriz (ajuste ate a imagem sair correta):
   uint8_t  mapSerp;      // 1 = fiacao serpentina (zig-zag)  0 = progressiva
@@ -163,6 +170,10 @@ void loadDefaults() {
   cfg.dieselMode   = 1;            // projeto e para motor diesel
   cfg.centerEnable = 1;
   cfg.centerR = 0; cfg.centerG = 255; cfg.centerB = 0;  // verde
+
+  cfg.lowEnable = 0;
+  cfg.lowLambda = 0.80f;
+  cfg.lowR = 0; cfg.lowG = 0; cfg.lowB = 255;           // azul (distinto do verde)
 
   cfg.mapSerp = 1; cfg.mapFlipX = 0; cfg.mapFlipY = 0; cfg.mapTranspose = 0;
 }
@@ -276,38 +287,54 @@ void render() {
   bool on[NUM_LEDS];
   for (uint16_t i = 0; i < NUM_LEDS; i++) on[i] = false;
 
-  // Faixa de linhas conforme a tendencia
-  uint8_t rowsMask = (trend > 0) ? cfg.rowsRising
-                   : (trend < 0) ? cfg.rowsFalling
-                                 : cfg.rowsStable;
+  // Indicador central "abaixo do limite": quando a media movel cai ABAIXO de
+  // lowLambda, o painel mostra so o quadrado 2x2 central (na cor low), igual ao
+  // LED de repouso, mas para o extremo oposto. Tem prioridade sobre a barra.
+  bool lowActive = cfg.lowEnable && (mavg <= cfg.lowLambda);
 
-  // Barra: acende a coluna conforme o modo (normal x diesel/invertido)
-  uint8_t colsLit = 0;
-  for (uint8_t x = 0; x < 8; x++) {
-    if (isColLit(x)) {
-      colsLit++;
-      CRGB c(cfg.colR[x], cfg.colG[x], cfg.colB[x]);
-      for (uint8_t y = 0; y < 8; y++) {
-        if (rowsMask & (1 << y)) {
-          uint16_t idx = XY(x, y);
-          leds[idx] = c;
-          on[idx] = true;
-        }
-      }
-    }
-  }
-
-  // LED verde central (quadrado 2x2): painel em repouso, nenhuma coluna acesa
-  // = valor acima do primeiro LED a acender.
-  if (cfg.centerEnable && colsLit == 0) {
-    CRGB g(cfg.centerR, cfg.centerG, cfg.centerB);
+  if (lowActive) {
+    CRGB lc(cfg.lowR, cfg.lowG, cfg.lowB);
     const uint8_t cx[2] = {3, 4}, cy[2] = {3, 4};
     for (uint8_t a = 0; a < 2; a++)
       for (uint8_t b = 0; b < 2; b++) {
         uint16_t idx = XY(cx[a], cy[b]);
-        leds[idx] = g;
+        leds[idx] = lc;
         on[idx] = true;
       }
+  } else {
+    // Faixa de linhas conforme a tendencia
+    uint8_t rowsMask = (trend > 0) ? cfg.rowsRising
+                     : (trend < 0) ? cfg.rowsFalling
+                                   : cfg.rowsStable;
+
+    // Barra: acende a coluna conforme o modo (normal x diesel/invertido)
+    uint8_t colsLit = 0;
+    for (uint8_t x = 0; x < 8; x++) {
+      if (isColLit(x)) {
+        colsLit++;
+        CRGB c(cfg.colR[x], cfg.colG[x], cfg.colB[x]);
+        for (uint8_t y = 0; y < 8; y++) {
+          if (rowsMask & (1 << y)) {
+            uint16_t idx = XY(x, y);
+            leds[idx] = c;
+            on[idx] = true;
+          }
+        }
+      }
+    }
+
+    // LED verde central (quadrado 2x2): painel em repouso, nenhuma coluna acesa
+    // = valor acima do primeiro LED a acender.
+    if (cfg.centerEnable && colsLit == 0) {
+      CRGB g(cfg.centerR, cfg.centerG, cfg.centerB);
+      const uint8_t cx[2] = {3, 4}, cy[2] = {3, 4};
+      for (uint8_t a = 0; a < 2; a++)
+        for (uint8_t b = 0; b < 2; b++) {
+          uint16_t idx = XY(cx[a], cy[b]);
+          leds[idx] = g;
+          on[idx] = true;
+        }
+    }
   }
 
   // Brilho da barra/LED central: aplicado so nos pixels "acesos" (on),
@@ -318,8 +345,10 @@ void render() {
   // Alerta: acende/pisca os LEDs apagados e aciona a saida fisica do alerta.
   // Usa alarmActive (condicao + tempo minimo ligado), atualizado no loop().
   // O alerta tem brilho PROPRIO (cfg.alertBright), independente do global.
+  // O indicador "abaixo do limite" tem PRIORIDADE: enquanto ativo, o alerta fica
+  // suprimido (nada pisca e a saida fisica fica em repouso) -> painel "calmo".
   bool alertOutActive = false;
-  if (alarmActive) {
+  if (alarmActive && !lowActive) {
     bool show = true;
     if (cfg.alertType == 1) {               // piscando
       uint16_t p = cfg.alertTime ? cfg.alertTime : 300;
@@ -371,6 +400,10 @@ void sendConfig() {
   Serial.print(F(" CENTER=")); Serial.print(cfg.centerEnable); Serial.print(',');
   Serial.print(cfg.centerR); Serial.print(','); Serial.print(cfg.centerG);
   Serial.print(','); Serial.print(cfg.centerB);
+  Serial.print(F(" LOW=")); Serial.print(cfg.lowEnable); Serial.print(',');
+  Serial.print(cfg.lowLambda, 3); Serial.print(',');
+  Serial.print(cfg.lowR); Serial.print(','); Serial.print(cfg.lowG);
+  Serial.print(','); Serial.print(cfg.lowB);
   Serial.print(F(" MAP=")); Serial.print(cfg.mapSerp); Serial.print(',');
   Serial.print(cfg.mapFlipX); Serial.print(','); Serial.print(cfg.mapFlipY);
   Serial.print(','); Serial.print(cfg.mapTranspose);
@@ -464,6 +497,14 @@ void handleLine(char *line) {
     cfg.centerB = atoi(strtok(NULL, " "));
     Serial.println(F("OK CENTER"));
   }
+  else if (!strcmp(cmd, "LOW")) {                // LOW enable lambda r g b
+    cfg.lowEnable = atoi(strtok(NULL, " ")) ? 1 : 0;
+    cfg.lowLambda = atof(strtok(NULL, " "));
+    cfg.lowR = atoi(strtok(NULL, " "));
+    cfg.lowG = atoi(strtok(NULL, " "));
+    cfg.lowB = atoi(strtok(NULL, " "));
+    Serial.println(F("OK LOW"));
+  }
   else if (!strcmp(cmd, "MAP")) {                // MAP serp flipx flipy transpose
     cfg.mapSerp      = atoi(strtok(NULL, " ")) ? 1 : 0;
     cfg.mapFlipX     = atoi(strtok(NULL, " ")) ? 1 : 0;
@@ -494,9 +535,10 @@ void handleSerial() {
 }
 
 void sendTelemetry() {
-  // D <tensao> <lambda> <mavg> <trend> <colMask> <alarme> <central>
+  // D <tensao> <lambda> <mavg> <trend> <colMask> <alarme> <central> <baixo>
   uint8_t colMask = 0;
   for (uint8_t x = 0; x < 8; x++) if (isColLit(x)) colMask |= (1 << x);
+  uint8_t low = (cfg.lowEnable && (mavg <= cfg.lowLambda)) ? 1 : 0;
   uint8_t center = (cfg.centerEnable && colMask == 0) ? 1 : 0;
   Serial.print(F("D "));
   Serial.print(lastVoltage, 3); Serial.print(' ');
@@ -505,7 +547,8 @@ void sendTelemetry() {
   Serial.print(trend);          Serial.print(' ');
   Serial.print(colMask);        Serial.print(' ');
   Serial.print(alarmActive ? 1 : 0); Serial.print(' ');
-  Serial.println(center);
+  Serial.print(center);         Serial.print(' ');
+  Serial.println(low);
 }
 
 // ---------------------------------------------------------------------
