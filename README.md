@@ -38,6 +38,16 @@ PAINEL LED/
 |----------------------------|:-------------:|---------------------------|
 | Saída de alerta (negativo/GND) | **D10**   | Relé / buzina via transistor |
 
+| Sinal (GPS GPS6MV2 / HW-248 / NEO-6M) | Arduino Micro | Observação |
+|---------------------------------------|:-------------:|------------|
+| **TX** do GPS                         | **D0 (RX1)**  | Serial1 de hardware — só o **Micro** tem, não conflita com o USB |
+| **VCC** do GPS                        | **5V**        | O módulo tem regulador próprio p/ 3,3 V |
+| **GND** do GPS                        | **GND**       | Terra comum |
+
+> O RX do GPS **não precisa** ser ligado (leitura só). O **Nano não serve** para
+> o GPS: só tem uma serial de hardware (ocupada pelo USB) e o SoftwareSerial
+> quebra com o FastLED. O modo prova é **exclusivo do Micro**.
+
 ### Saída de alerta (D10)
 - O **negativo (GND) do alerta sai no pino D10**.
 - **Repouso:** D10 fica em **HIGH**. **Em alerta:** D10 vai para **LOW**
@@ -152,8 +162,20 @@ DIESEL 0|1                   0=normal (>=)  1=diesel/invertido (<=)
 CENTER enable r g b          LED verde central (repouso)
 MAP serp flipx flipy transp  mapeamento fisico da matriz
 TEST 0|1                     padrao de teste p/ ajustar o mapeamento
-SAVE                         grava tudo na EEPROM
+SAVE                         grava tudo na EEPROM (config + GPS)
 STREAM 0|1                   liga/desliga telemetria
+
+--- Modo prova / GPS ---
+GGET                         devolve "GCFG ..." (config do GPS)
+GPSEN 0|1                    liga/desliga o contador de bolinhas
+GPSLINE latA lonA latB lonB  linha de chegada (segmento)
+BOLIM lambda limite          lambda limite da bolinha + nro p/ penalizar
+BHYST valor                  histerese p/ rearmar a contagem
+BROW 0..7                    linha da borda reservada ao contador
+BCOL idx r g b               cor: idx 0=normal 1=atencao 2=estourado
+BLAP minLapMs minSpeedKmh    tempo min. entre voltas + velocidade minima
+BRESET                       zera as bolinhas da volta atual
+LAPRESET                     zera bolinhas + contador de voltas
 ```
 
 Arduino → App (telemetria contínua, ~10 Hz):
@@ -163,6 +185,9 @@ D <tensao> <lambda> <mediaMovel> <trend> <colMask> <alarme> <central>
      trend:   1=subindo  0=estavel  -1=descendo
      colMask: bitmask das 8 colunas acesas (bit0=col1)
      central: 1 = LED verde central aceso (em repouso)
+
+G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnt> <voltas>   (~4 Hz, só com GPS ligado)
+     valido:  1 = fix de GPS válido
 ```
 
 ## 6. Corrigir LEDs invertidos / zig-zag (mapeamento)
@@ -182,3 +207,43 @@ indo”. Ajuste **sem recompilar**, pelo app (aba **Configurações → Mapeamen
 
 > Combinações típicas do CJMCU-64: só **Serpentina**; ou **Serpentina + Espelhar
 > Y**; ou **Transpor + Serpentina**. Vá testando — são poucos cliques.
+
+## 7. Modo prova — GPS + contador de "bolinhas"
+
+Conta as **bolinhas** (cada vez que a sonda passa do valor permitido pela prova) e
+mostra numa **linha da borda** do painel reservada só pra isso — o resto do painel
+continua funcionando igual. A cada **linha de chegada** cruzada (via GPS), o
+contador **zera** (nova volta). Tudo roda **no próprio Arduino** (funciona sem
+notebook no caminhão); o app só configura e monitora.
+
+- **Config em EEPROM separada:** ativar o GPS **não apaga** sua configuração atual
+  (cores, calibração, lambdas). Se algo der errado, `LOAD` recarrega tudo.
+- **Como conta 1 bolinha:** cada **excursão** do valor de sonda além do *lambda
+  limite* (independente do alerta visual). Uma histerese evita contar a mesma
+  excursão várias vezes quando o valor treme na borda.
+- **No painel:** 1 LED por bolinha na linha reservada. **Verde** normal, **âmbar**
+  quando falta 1 pro limite, **vermelho piscando** ao estourar (≥ limite, padrão 6).
+
+### Aba **Prova / GPS** (no app)
+1. Marque **Ligar contador de bolinhas**.
+2. Ajuste **lambda limite**, **limite de bolinhas** (padrão 6), a **linha
+   reservada** (base/topo) e as cores.
+3. Defina a **linha de chegada**:
+   - **Auto-detectar pela posição** escolhe a pista mais próxima do banco
+     (`app/tracks.json`); **ou** selecione a pista na lista; **ou**
+   - **Capturar linha aqui** (o mais preciso): pare/passe **em cima da linha** e
+     clique — ele gera o segmento perpendicular ao seu rumo (largura configurável).
+     Depois **Salvar linha nesta pista** grava no banco pra próxima vez.
+4. **Enviar e gravar configurações do GPS**.
+5. Acompanhe **GPS ao vivo** (sinal/sats, posição, velocidade, bolinhas da volta,
+   volta anterior, nº de voltas). Botões **Zerar bolinhas / Zerar voltas**.
+
+> **Precisão:** o NEO-6M tem ~2,5 m de erro e sai de fábrica a 1 Hz. A detecção
+> usa **cruzamento de segmento** (trecho percorrido × linha de chegada), então
+> funciona mesmo a 1 Hz, mas a **captura no local** é sempre mais confiável que as
+> coordenadas aproximadas do banco. Há filtros de **velocidade mínima** e **tempo
+> mínimo entre voltas** pra não contar volta parado no box.
+
+> **Não existe** um banco oficial/global com a linha de chegada exata de todas as
+> pistas — por isso o banco embutido traz só pontos **aproximados** (pra
+> auto-detectar o nome) e o fluxo recomendado é **capturar a sua linha** na pista.

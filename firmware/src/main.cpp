@@ -101,6 +101,66 @@ struct Config {
 Config cfg;
 
 // ---------------------------------------------------------------------
+//  CONFIGURACAO DO GPS / BOLINHAS  (EEPROM SEPARADA - nao mexe na Config)
+// ---------------------------------------------------------------------
+//  Fica num endereco proprio da EEPROM para que a config principal (cores,
+//  calibracao, lambdas, etc.) NAO seja apagada ao adicionar o modulo GPS.
+//  Modulo: GPS6MV2 / HW-248 (NEO-6M) ligado na Serial1 do Arduino Micro:
+//    TX do GPS -> D0 (RX1 do Micro)   |   VCC 5V   |   GND comum
+#define GCFG_MAGIC   0x6D
+#define GCFG_VERSION 1
+#define GCFG_ADDR    400      // bem depois da Config (que fica em 0)
+
+struct GpsCfg {
+  uint8_t  magic;
+  uint8_t  version;
+
+  uint8_t  enable;        // 1 = liga a contagem de bolinhas + linha reservada no painel
+
+  // Linha de chegada como SEGMENTO A--B (2 pontos GPS). O cruzamento e detectado
+  // testando se o trecho percorrido (posicao anterior->atual) cruza esse segmento.
+  float    latA, lonA;
+  float    latB, lonB;
+
+  // "Bolinha": estouro do valor de sonda permitido pela prova. Limite SEPARADO
+  // do alerta visual. Em modo diesel conta quando a media movel fica <= bolimLambda.
+  float    bolimLambda;   // limite de sonda que caracteriza a bolinha
+  float    bolimHyst;     // histerese p/ rearmar (evita contar tremida na borda)
+  uint8_t  bolimLimit;    // a partir deste nro de bolinhas = penalizado (ex.: 6)
+
+  // Linha da borda reservada so pro contador (0 = topo ... 7 = base)
+  uint8_t  bolimRow;
+
+  // Cores do contador: normal / atencao (falta 1) / estourado
+  uint8_t  nR, nG, nB;    // normal
+  uint8_t  wR, wG, wB;    // atencao
+  uint8_t  oR, oG, oB;    // estourado
+
+  uint16_t minLapMs;      // tempo minimo entre cruzamentos (anti-duplo, ms)
+  uint8_t  minSpeed;      // velocidade minima p/ validar cruzamento (km/h)
+};
+
+GpsCfg gcfg;
+
+// ---------------------------------------------------------------------
+//  ESTADO DO GPS / BOLINHAS EM TEMPO REAL
+// ---------------------------------------------------------------------
+bool    gValid   = false;      // fix valido (RMC status = A)
+uint8_t gSats    = 0;          // satelites (do GGA)
+float   gLat = 0.0f, gLon = 0.0f;
+float   gPrevLat = 0.0f, gPrevLon = 0.0f;
+bool    gHasPrev = false;
+float   gSpeedKmh = 0.0f;
+float   gCourse   = 0.0f;
+
+uint16_t bolinhas        = 0;  // bolinhas da VOLTA atual
+uint16_t lastLapBolinhas = 0;  // bolinhas da volta anterior (fechada ao cruzar)
+uint16_t lapCount        = 0;  // numero de voltas contadas
+bool     bolArmed        = true;
+uint32_t lastCrossMs     = 0;  // millis() do ultimo cruzamento da linha
+uint32_t tGtelem = 0;          // timer da telemetria do GPS
+
+// ---------------------------------------------------------------------
 //  ESTADO EM TEMPO REAL
 // ---------------------------------------------------------------------
 float   ring[MAX_WINDOW];      // buffer circular de amostras (lambda)
@@ -200,6 +260,40 @@ void loadEEPROM() {
   }
 }
 
+// ---- GPS / bolinhas: defaults e EEPROM propria ----------------------
+void loadGpsDefaults() {
+  gcfg.magic   = GCFG_MAGIC;
+  gcfg.version = GCFG_VERSION;
+  gcfg.enable  = 0;                 // desligado ate configurar a linha de chegada
+  gcfg.latA = 0.0f; gcfg.lonA = 0.0f;
+  gcfg.latB = 0.0f; gcfg.lonB = 0.0f;
+  gcfg.bolimLambda = 1.33f;         // mesmo default do alarme, mas independente
+  gcfg.bolimHyst   = 0.03f;
+  gcfg.bolimLimit  = 6;             // 6 ou mais = penalizado
+  gcfg.bolimRow    = 7;             // linha de baixo reservada pro contador
+  gcfg.nR = 0;   gcfg.nG = 255; gcfg.nB = 0;    // normal  = verde
+  gcfg.wR = 255; gcfg.wG = 140; gcfg.wB = 0;    // atencao = ambar
+  gcfg.oR = 255; gcfg.oG = 0;   gcfg.oB = 0;    // estouro = vermelho
+  gcfg.minLapMs = 15000;           // no minimo 15 s entre voltas
+  gcfg.minSpeed = 20;              // so conta cruzamento acima de 20 km/h
+}
+
+void saveGps() { EEPROM.put(GCFG_ADDR, gcfg); }
+
+void loadGps() {
+  EEPROM.get(GCFG_ADDR, gcfg);
+  if (gcfg.magic != GCFG_MAGIC || gcfg.version != GCFG_VERSION) {
+    loadGpsDefaults();
+    saveGps();
+  }
+}
+
+// A linha de chegada so vale se os dois pontos foram definidos (nao-zero)
+bool lineValid() {
+  return (gcfg.latA != 0.0f || gcfg.lonA != 0.0f) &&
+         (gcfg.latB != 0.0f || gcfg.lonB != 0.0f);
+}
+
 // Recalcula parametros derivados quando a config muda
 void applyConfig() {
   if (cfg.sampleRate < 1)   cfg.sampleRate = 1;
@@ -244,6 +338,162 @@ void pushSample(float lam) {
   ringSum += lam;
   ringHead = (ringHead + 1) % windowN;
   mavg = ringSum / ringCount;
+}
+
+// ---------------------------------------------------------------------
+//  GPS  (NEO-6M / GPS6MV2-HW248 na Serial1, NMEA 9600 bps)
+// ---------------------------------------------------------------------
+// Converte "ddmm.mmmm" (NMEA) -> graus decimais. Serve p/ lat e lon: os
+// minutos sao sempre os 2 digitos antes do ponto decimal.
+float nmeaToDeg(const char *f, char hemi) {
+  if (!f || !*f) return 0.0f;
+  double v   = atof(f);
+  int    deg = (int)(v / 100.0);
+  double min = v - deg * 100.0;
+  double d   = deg + min / 60.0;
+  if (hemi == 'S' || hemi == 's' || hemi == 'W' || hemi == 'w') d = -d;
+  return (float)d;
+}
+
+// Sinal do produto vetorial (b-a) x (c-a). x=lon, y=lat (planar na escala da pista)
+float cross3(float ax, float ay, float bx, float by, float cx, float cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// Os segmentos P1P2 e P3P4 se cruzam?
+bool segmentsCross(float p1x, float p1y, float p2x, float p2y,
+                   float p3x, float p3y, float p4x, float p4y) {
+  float d1 = cross3(p3x, p3y, p4x, p4y, p1x, p1y);
+  float d2 = cross3(p3x, p3y, p4x, p4y, p2x, p2y);
+  float d3 = cross3(p1x, p1y, p2x, p2y, p3x, p3y);
+  float d4 = cross3(p1x, p1y, p2x, p2y, p4x, p4y);
+  return (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+          ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)));
+}
+
+// Detecta o cruzamento da linha de chegada e fecha a volta (zera as bolinhas).
+void checkLapCross() {
+  if (!gcfg.enable || !gValid || !lineValid()) return;
+  if (gHasPrev && gSpeedKmh >= gcfg.minSpeed) {
+    if (segmentsCross(gPrevLon, gPrevLat, gLon, gLat,
+                      gcfg.lonA, gcfg.latA, gcfg.lonB, gcfg.latB)) {
+      uint32_t now = millis();
+      if (now - lastCrossMs > gcfg.minLapMs) {
+        lastCrossMs     = now;
+        lastLapBolinhas = bolinhas;   // guarda o resultado da volta que fechou
+        bolinhas        = 0;          // zera p/ a nova volta
+        bolArmed        = true;
+        lapCount++;
+      }
+    }
+  }
+  gPrevLat = gLat; gPrevLon = gLon; gHasPrev = true;
+}
+
+// Quebra a sentenca em campos por virgula PRESERVANDO campos vazios (strtok
+// colapsaria ",," e desalinharia os indices). Corta tambem no '*' do checksum.
+// Retorna a quantidade de campos; preenche fld[] com ponteiros (in-place).
+uint8_t splitNMEA(char *s, char **fld, uint8_t maxf) {
+  uint8_t n = 0;
+  if (maxf == 0) return 0;
+  fld[n++] = s;
+  for (char *p = s; *p; p++) {
+    if (*p == ',') {
+      *p = 0;
+      if (n < maxf) fld[n++] = p + 1; else break;
+    } else if (*p == '*') {           // fim dos dados (comeca o checksum)
+      *p = 0;
+      break;
+    }
+  }
+  return n;
+}
+
+// Interpreta uma sentenca NMEA ja completa (sem o \r\n). Le RMC (posicao,
+// validade, velocidade, rumo) e GGA (satelites). Aceita GP/GN (GNSS misto).
+void parseNMEA(char *s) {
+  if (s[0] != '$' || strlen(s) < 7) return;
+  char *fld[16];
+  uint8_t nf = splitNMEA(s, fld, 16);
+  if (nf < 1 || strlen(fld[0]) < 6) return;
+  char *type = fld[0] + 3;              // pula "$GP"/"$GN"/"$GL"...
+
+  if (!strncmp(type, "RMC", 3) && nf >= 9) {
+    // $..RMC,time,status,lat,NS,lon,EW,speed,course,date,...
+    gValid = (fld[2][0] == 'A');
+    if (gValid) {
+      gLat = nmeaToDeg(fld[3], fld[4][0] ? fld[4][0] : 'N');
+      gLon = nmeaToDeg(fld[5], fld[6][0] ? fld[6][0] : 'E');
+      if (fld[7][0]) gSpeedKmh = atof(fld[7]) * 1.852f;   // nos -> km/h
+      if (fld[8][0]) gCourse   = atof(fld[8]);
+      checkLapCross();
+    }
+  }
+  else if (!strncmp(type, "GGA", 3) && nf >= 8) {
+    // $..GGA,time,lat,NS,lon,EW,fixqual,numsats,...
+    gSats = (uint8_t)atoi(fld[7]);
+  }
+}
+
+// Le a Serial1 do GPS, montando uma sentenca por vez.
+void readGps() {
+  static char line[84];
+  static uint8_t idx = 0;
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c == '\n' || c == '\r') {
+      if (idx > 0) { line[idx] = 0; parseNMEA(line); idx = 0; }
+    } else if (idx < sizeof(line) - 1) {
+      line[idx++] = c;
+    } else {
+      idx = 0;   // sentenca gigante/corrompida: descarta
+    }
+  }
+}
+
+// Atualiza a contagem de bolinhas (estouro do valor de sonda permitido).
+// Uma bolinha e contada por EXCURSAO: cruzou o limite -> +1; so rearma
+// depois que a media movel volta alem da histerese.
+void updateBolinha() {
+  if (!gcfg.enable) return;
+  bool viol  = cfg.dieselMode ? (mavg <= gcfg.bolimLambda)
+                              : (mavg >= gcfg.bolimLambda);
+  bool clear = cfg.dieselMode ? (mavg >= gcfg.bolimLambda + gcfg.bolimHyst)
+                              : (mavg <= gcfg.bolimLambda - gcfg.bolimHyst);
+  if (bolArmed && viol)        { bolinhas++; bolArmed = false; }
+  else if (!bolArmed && clear) { bolArmed = true; }
+}
+
+// Desenha a linha da borda reservada ao contador de bolinhas (por cima de tudo).
+uint16_t XY(uint8_t x, uint8_t y);   // definida na secao de MAPEAMENTO
+void drawBolinhaRow() {
+  if (!gcfg.enable) return;
+  uint8_t row = gcfg.bolimRow & 0x07;
+  uint8_t lim = gcfg.bolimLimit < 2 ? 2 : gcfg.bolimLimit;
+  bool over = bolinhas >= lim;
+  bool warn = bolinhas == (uint16_t)(lim - 1);
+
+  CRGB c = over ? CRGB(gcfg.oR, gcfg.oG, gcfg.oB)
+         : warn ? CRGB(gcfg.wR, gcfg.wG, gcfg.wB)
+                : CRGB(gcfg.nR, gcfg.nG, gcfg.nB);
+
+  // limpa a linha reservada
+  for (uint8_t x = 0; x < 8; x++) leds[XY(x, row)] = CRGB::Black;
+
+  // estourado pisca a linha inteira; senao acende 1 LED por bolinha
+  bool show = true;
+  if (over) {
+    uint16_t p = cfg.alertTime ? cfg.alertTime : 300;
+    show = ((millis() / p) & 0x01) == 0;
+  }
+  if (show) {
+    uint8_t n = over ? 8 : (bolinhas > 8 ? 8 : (uint8_t)bolinhas);
+    for (uint8_t x = 0; x < n; x++) {
+      CRGB cc = c;
+      cc.nscale8_video(cfg.brightness);
+      leds[XY(x, row)] = cc;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -365,6 +615,10 @@ void render() {
   // Saida fisica do alerta: LOW = negativo/GND ativo, HIGH = repouso
   digitalWrite(ALERT_OUT_PIN, alertOutActive ? LOW : HIGH);
 
+  // Linha reservada ao contador de bolinhas: desenhada POR CIMA de tudo
+  // (barra, alerta, central), so quando o modo GPS/bolinhas esta ligado.
+  drawBolinhaRow();
+
   FastLED.show();
 }
 
@@ -410,14 +664,37 @@ void sendConfig() {
   Serial.println();
 }
 
+// Dump da config do GPS/bolinhas (o app le p/ preencher a aba Prova)
+void sendGpsConfig() {
+  Serial.print(F("GCFG"));
+  Serial.print(F(" EN="));   Serial.print(gcfg.enable);
+  Serial.print(F(" LINE=")); Serial.print(gcfg.latA, 6); Serial.print(',');
+  Serial.print(gcfg.lonA, 6); Serial.print(','); Serial.print(gcfg.latB, 6);
+  Serial.print(','); Serial.print(gcfg.lonB, 6);
+  Serial.print(F(" BOLIM=")); Serial.print(gcfg.bolimLambda, 3); Serial.print(',');
+  Serial.print(gcfg.bolimLimit);
+  Serial.print(F(" HYST=")); Serial.print(gcfg.bolimHyst, 3);
+  Serial.print(F(" ROW="));  Serial.print(gcfg.bolimRow);
+  Serial.print(F(" BC0=")); Serial.print(gcfg.nR); Serial.print(',');
+  Serial.print(gcfg.nG); Serial.print(','); Serial.print(gcfg.nB);
+  Serial.print(F(" BC1=")); Serial.print(gcfg.wR); Serial.print(',');
+  Serial.print(gcfg.wG); Serial.print(','); Serial.print(gcfg.wB);
+  Serial.print(F(" BC2=")); Serial.print(gcfg.oR); Serial.print(',');
+  Serial.print(gcfg.oG); Serial.print(','); Serial.print(gcfg.oB);
+  Serial.print(F(" LAP=")); Serial.print(gcfg.minLapMs); Serial.print(',');
+  Serial.print(gcfg.minSpeed);
+  Serial.println();
+}
+
 void handleLine(char *line) {
   char *cmd = strtok(line, " ");
   if (!cmd) return;
 
   if      (!strcmp(cmd, "PING"))  { Serial.println(F("PONG PainelLambda v1")); }
-  else if (!strcmp(cmd, "GET"))   { sendConfig(); }
-  else if (!strcmp(cmd, "SAVE"))  { saveEEPROM(); Serial.println(F("OK SAVE")); }
-  else if (!strcmp(cmd, "LOAD"))  { loadEEPROM(); applyConfig(); Serial.println(F("OK LOAD")); }
+  else if (!strcmp(cmd, "GET"))   { sendConfig(); sendGpsConfig(); }
+  else if (!strcmp(cmd, "GGET"))  { sendGpsConfig(); }
+  else if (!strcmp(cmd, "SAVE"))  { saveEEPROM(); saveGps(); Serial.println(F("OK SAVE")); }
+  else if (!strcmp(cmd, "LOAD"))  { loadEEPROM(); applyConfig(); loadGps(); Serial.println(F("OK LOAD")); }
   else if (!strcmp(cmd, "STREAM")){ char*a=strtok(NULL," "); streaming = a && a[0]=='1'; Serial.println(F("OK STREAM")); }
 
   else if (!strcmp(cmd, "COLOR")) {              // COLOR i r g b
@@ -516,6 +793,56 @@ void handleLine(char *line) {
     testMode = atoi(strtok(NULL, " ")) ? true : false;
     Serial.println(F("OK TEST"));
   }
+  // ---- GPS / bolinhas ----
+  else if (!strcmp(cmd, "GPSEN")) {              // GPSEN 0|1
+    gcfg.enable = atoi(strtok(NULL, " ")) ? 1 : 0;
+    Serial.println(F("OK GPSEN"));
+  }
+  else if (!strcmp(cmd, "GPSLINE")) {            // GPSLINE latA lonA latB lonB
+    gcfg.latA = atof(strtok(NULL, " "));
+    gcfg.lonA = atof(strtok(NULL, " "));
+    gcfg.latB = atof(strtok(NULL, " "));
+    gcfg.lonB = atof(strtok(NULL, " "));
+    Serial.println(F("OK GPSLINE"));
+  }
+  else if (!strcmp(cmd, "BOLIM")) {              // BOLIM lambda limite
+    gcfg.bolimLambda = atof(strtok(NULL, " "));
+    char *l = strtok(NULL, " ");
+    if (l) gcfg.bolimLimit = (uint8_t)atoi(l);
+    Serial.println(F("OK BOLIM"));
+  }
+  else if (!strcmp(cmd, "BHYST")) {              // BHYST valor
+    gcfg.bolimHyst = atof(strtok(NULL, " "));
+    Serial.println(F("OK BHYST"));
+  }
+  else if (!strcmp(cmd, "BROW")) {               // BROW linha(0..7)
+    gcfg.bolimRow = (uint8_t)atoi(strtok(NULL, " ")) & 0x07;
+    Serial.println(F("OK BROW"));
+  }
+  else if (!strcmp(cmd, "BCOL")) {               // BCOL idx r g b  (0=normal 1=atencao 2=estouro)
+    int idx = atoi(strtok(NULL, " "));
+    int r = atoi(strtok(NULL, " "));
+    int g = atoi(strtok(NULL, " "));
+    int b = atoi(strtok(NULL, " "));
+    if      (idx == 0) { gcfg.nR = r; gcfg.nG = g; gcfg.nB = b; }
+    else if (idx == 1) { gcfg.wR = r; gcfg.wG = g; gcfg.wB = b; }
+    else if (idx == 2) { gcfg.oR = r; gcfg.oG = g; gcfg.oB = b; }
+    Serial.println(F("OK BCOL"));
+  }
+  else if (!strcmp(cmd, "BLAP")) {               // BLAP minLapMs minSpeedKmh
+    gcfg.minLapMs = (uint16_t)atoi(strtok(NULL, " "));
+    char *s = strtok(NULL, " ");
+    if (s) gcfg.minSpeed = (uint8_t)atoi(s);
+    Serial.println(F("OK BLAP"));
+  }
+  else if (!strcmp(cmd, "BRESET")) {             // zera as bolinhas da volta atual
+    bolinhas = 0; bolArmed = true;
+    Serial.println(F("OK BRESET"));
+  }
+  else if (!strcmp(cmd, "LAPRESET")) {           // zera bolinhas + contador de voltas
+    bolinhas = 0; lastLapBolinhas = 0; lapCount = 0; bolArmed = true; gHasPrev = false;
+    Serial.println(F("OK LAPRESET"));
+  }
   else {
     Serial.print(F("ERR ")); Serial.println(cmd);
   }
@@ -551,23 +878,40 @@ void sendTelemetry() {
   Serial.println(low);
 }
 
+void sendGpsTelemetry() {
+  // G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnterior> <voltas>
+  Serial.print(F("G "));
+  Serial.print(gValid ? 1 : 0);   Serial.print(' ');
+  Serial.print(gSats);            Serial.print(' ');
+  Serial.print(gLat, 6);          Serial.print(' ');
+  Serial.print(gLon, 6);          Serial.print(' ');
+  Serial.print(gSpeedKmh, 1);     Serial.print(' ');
+  Serial.print(gCourse, 0);       Serial.print(' ');
+  Serial.print(bolinhas);         Serial.print(' ');
+  Serial.print(lastLapBolinhas);  Serial.print(' ');
+  Serial.println(lapCount);
+}
+
 // ---------------------------------------------------------------------
 //  SETUP / LOOP
 // ---------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
+  Serial1.begin(9600);                 // GPS NEO-6M (GPS6MV2/HW-248) na Serial1 (RX=D0)
   analogReference(DEFAULT);
   pinMode(ALERT_OUT_PIN, OUTPUT);
   digitalWrite(ALERT_OUT_PIN, HIGH);   // repouso (sem alerta)
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   loadEEPROM();
   applyConfig();
+  loadGps();
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   FastLED.show();
 }
 
 void loop() {
   handleSerial();
+  readGps();                 // consome as sentencas NMEA da Serial1
   uint32_t now = millis();
 
   if (now - tSample >= sampleInterval) {
@@ -575,6 +919,7 @@ void loop() {
     lastVoltage = readVoltage();
     lastLambda  = toLambda(lastVoltage);
     pushSample(lastLambda);
+    updateBolinha();         // conta bolinha por excursao do valor de sonda
   }
 
   if (now - tTrend >= TREND_MS) {
@@ -600,5 +945,10 @@ void loop() {
   if (streaming && now - tTelem >= TELEM_MS) {
     tTelem = now;
     sendTelemetry();
+  }
+
+  if (streaming && gcfg.enable && now - tGtelem >= 250) {
+    tGtelem = now;
+    sendGpsTelemetry();      // telemetria do GPS/bolinhas (~4 Hz)
   }
 }
