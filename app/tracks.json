@@ -1,16 +1,22 @@
 {
-  "_nota": "Banco de pistas (Brasil). 'ref' = ponto aproximado da pista, usado so para AUTO-DETECTAR a pista mais proxima pelo GPS. 'linha' = linha de chegada como [latA, lonA, latB, lonB]; quando null, capture no local com o botao 'Capturar linha aqui' (mais preciso) e depois 'Salvar na pista' para gravar aqui. Coordenadas de referencia sao aproximadas - confirme sempre capturando a linha real.",
+  "_nota": "Banco de pistas (Brasil). 'ref' = ponto aproximado da pista, usado so para AUTO-DETECTAR a pista mais proxima pelo GPS. 'ponto' = ponto da linha de chegada como [lat, lon]; quando null, capture no local com o botao 'Capturar ponto aqui' (ex.: com o caminhao parado no box) e depois 'Salvar na pista' para gravar aqui. Coordenadas de referencia sao aproximadas - confirme sempre capturando o ponto real.",
   "pistas": [
-    { "nome": "Interlagos (Jose Carlos Pace)", "cidade": "Sao Paulo", "uf": "SP", "ref": [-23.7014, -46.6997], "linha": null },
-    { "nome": "Velo Citta", "cidade": "Mogi Guacu", "uf": "SP", "ref": [-22.3345, -46.9380], "linha": null },
-    { "nome": "Goiania (Ayrton Senna)", "cidade": "Goiania", "uf": "GO", "ref": [-16.7063, -49.3312], "linha": null },
-    { "nome": "Taruma", "cidade": "Viamao", "uf": "RS", "ref": [-30.0170, -51.0360], "linha": null },
-    { "nome": "Velopark", "cidade": "Nova Santa Rita", "uf": "RS", "ref": [-29.8600, -51.2800], "linha": null },
-    { "nome": "Cascavel (Zilmar Beux)", "cidade": "Cascavel", "uf": "PR", "ref": [-24.9940, -53.4120], "linha": null },
-    { "nome": "Londrina (Ayrton Senna)", "cidade": "Londrina", "uf": "PR", "ref": [-23.3340, -51.1350], "linha": null },
-    { "nome": "Curitiba (Raul Boesel/Pinhais)", "cidade": "Pinhais", "uf": "PR", "ref": [-25.4400, -49.1300], "linha": null },
-    { "nome": "Santa Cruz do Sul", "cidade": "Santa Cruz do Sul", "uf": "RS", "ref": [-29.7190, -52.4360], "linha": null },
-    { "nome": "Caruaru", "cidade": "Caruaru", "uf": "PE", "ref": [-8.2820, -35.9760], "linha": null },
-    { "nome": "Fortaleza (Virgilio Tavora)", "cidade": "Eusebio", "uf": "CE", "ref": [-3.8900, -38.4500], "linha": null }
+    { "nome": "Interlagos (Jose Carlos Pace)", "cidade": "Sao Paulo", "uf": "SP", "ref": [-23.7014, -46.6997], "ponto": [-23.7031536, -46.7001801] },
+    { "nome": "Velo Citta", "cidade": "Mogi Guacu", "uf": "SP", "ref": [-22.3345, -46.9380], "ponto": [-22.2877483, -46.8480721] },
+    { "nome": "Goiania (Ayrton Senna)", "cidade": "Goiania", "uf": "GO", "ref": [-16.7063, -49.3312], "ponto": [-16.7194004, -49.1930275] },
+    { "nome": "Taruma", "cidade": "Viamao", "uf": "RS", "ref": [-30.0170, -51.0360], "ponto": [-30.0508957, -51.0184669] },
+    { "nome": "Velopark", "cidade": "Nova Santa Rita", "uf": "RS", "ref": [-29.8600, -51.2800], "ponto": [-29.8236370, -51.3208427] },
+    { "nome": "Cascavel (Zilmar Beux)", "cidade": "Cascavel", "uf": "PR", "ref": [-24.9940, -53.4120], "ponto": [-24.9821377, -53.3886795] },
+    { "nome": "Londrina (Ayrton Senna)", "cidade": "Londrina", "uf": "PR", "ref": [-23.3340, -51.1350], "ponto": [-23.2818851, -51.1687584] },
+    { "nome": "Curitiba (Raul Boesel/Pinhais)", "cidade": "Pinhais", "uf": "PR", "ref": [-25.4400, -49.1300], "ponto": null },
+    { "nome": "Santa Cruz do Sul", "cidade": "Santa Cruz do Sul", "uf": "RS", "ref": [-29.7190, -52.4360], "ponto": [-29.8012295, -52.4342537] },
+    { "nome": "Caruaru", "cidade": "Caruaru", "uf": "PE", "ref": [-8.2820, -35.9760], "ponto": null },
+    { "nome": "Fortaleza (Virgilio Tavora)", "cidade": "Eusebio", "uf": "CE", "ref": [-3.8900, -38.4500], "ponto": null },
+    { "nome": "Cuiaba (Ayrton Senna)", "cidade": "Cuiaba", "uf": "MT", "ref": [-15.6500, -56.1200], "ponto": null },
+    { "nome": "Curvelo", "cidade": "Curvelo", "uf": "MG", "ref": [-18.7560, -44.4310], "ponto": [-18.8078918, -44.4083328] },
+    { "nome": "Potenza", "cidade": "Lima Duarte", "uf": "MG", "ref": [-21.8500, -43.8000], "ponto": null },
+    { "nome": "Brasilia (Nelson Piquet)", "cidade": "Brasilia", "uf": "DF", "ref": [-15.7760, -47.9060], "ponto": [-15.7728577, -47.9002533] },
+    { "nome": "Guapore", "cidade": "Guapore", "uf": "RS", "ref": [-28.8500, -51.8700], "ponto": [-28.8439293, -51.8515701] },
+    { "nome": "Rivera (Uruguai)", "cidade": "Rivera", "uf": "UY", "ref": [-30.9000, -55.5500], "ponto": [-30.8645992, -55.6080971] }
   ]
 }

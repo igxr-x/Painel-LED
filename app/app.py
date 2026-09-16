@@ -565,10 +565,10 @@ class App(tk.Tk):
         ttk.Label(g1, text="Penaliza a partir de N bolinhas:").grid(row=0, column=2, sticky="e", padx=4)
         self.bolim_limit = tk.StringVar(value="6")
         ttk.Entry(g1, textvariable=self.bolim_limit, width=6).grid(row=0, column=3, padx=4)
-        ttk.Label(g1, text="Histerese p/ rearmar:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.bolim_hyst = tk.StringVar(value="0.03")
-        ttk.Entry(g1, textvariable=self.bolim_hyst, width=8).grid(row=1, column=1, padx=4)
-        ttk.Label(g1, text="(a sonda precisa 'voltar' esse tanto antes de contar outra bolinha)",
+        ttk.Label(g1, text="Tempo entre bolinhas (s):").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.bolim_debounce_s = tk.StringVar(value="2.0")
+        ttk.Entry(g1, textvariable=self.bolim_debounce_s, width=8).grid(row=1, column=1, padx=4)
+        ttk.Label(g1, text="(regra: apos contar uma bolinha, espera esse tempo ate contar outra)",
                   foreground="#666").grid(row=1, column=2, columnspan=2, sticky="w", padx=4)
 
         # Aparencia no painel
@@ -605,28 +605,21 @@ class App(tk.Tk):
         self.track_cb.bind("<<ComboboxSelected>>", lambda e: self.track_selected())
         ttk.Button(g3, text="Auto-detectar pela posicao",
                    command=self.gps_autodetect).grid(row=0, column=3, padx=4)
-        ttk.Button(g3, text="Salvar linha nesta pista",
-                   command=self.save_line_to_track).grid(row=0, column=4, padx=4)
+        ttk.Button(g3, text="Salvar ponto nesta pista",
+                   command=self.save_point_to_track).grid(row=0, column=4, padx=4)
 
-        ttk.Label(g3, text="Linha A (lat, lon):").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.lineA_lat = tk.StringVar(value=""); self.lineA_lon = tk.StringVar(value="")
-        ttk.Entry(g3, textvariable=self.lineA_lat, width=13).grid(row=1, column=1, padx=2)
-        ttk.Entry(g3, textvariable=self.lineA_lon, width=13).grid(row=1, column=2, padx=2)
-        ttk.Label(g3, text="Linha B (lat, lon):").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-        self.lineB_lat = tk.StringVar(value=""); self.lineB_lon = tk.StringVar(value="")
-        ttk.Entry(g3, textvariable=self.lineB_lat, width=13).grid(row=2, column=1, padx=2)
-        ttk.Entry(g3, textvariable=self.lineB_lon, width=13).grid(row=2, column=2, padx=2)
+        ttk.Label(g3, text="Ponto (lat, lon):").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.point_lat = tk.StringVar(value=""); self.point_lon = tk.StringVar(value="")
+        ttk.Entry(g3, textvariable=self.point_lat, width=13).grid(row=1, column=1, padx=2)
+        ttk.Entry(g3, textvariable=self.point_lon, width=13).grid(row=1, column=2, padx=2)
+        ttk.Button(g3, text="Capturar ponto aqui",
+                   command=self.capture_point).grid(row=1, column=3, padx=4)
 
-        ttk.Label(g3, text="Largura da linha (m):").grid(row=3, column=0, sticky="e", padx=4, pady=6)
-        self.cap_width = tk.StringVar(value="30")
-        ttk.Entry(g3, textvariable=self.cap_width, width=6).grid(row=3, column=1, sticky="w", padx=2)
-        ttk.Button(g3, text="Capturar linha aqui (usa posicao + rumo)",
-                   command=self.capture_line).grid(row=3, column=2, columnspan=2, padx=4, sticky="w")
-        ttk.Button(g3, text="Capturar A", command=lambda: self.capture_point("A")).grid(row=4, column=1, padx=2, pady=2)
-        ttk.Button(g3, text="Capturar B", command=lambda: self.capture_point("B")).grid(row=4, column=2, padx=2, sticky="w")
-        ttk.Label(g3, text="Dica: pare/passe em cima da linha e clique 'Capturar linha aqui' "
-                           "-> gera o segmento perpendicular ao seu rumo.",
-                  foreground="#666").grid(row=5, column=0, columnspan=5, sticky="w", padx=4, pady=(0, 4))
+        ttk.Label(g3, text="Raio de deteccao (m):").grid(row=2, column=0, sticky="e", padx=4, pady=6)
+        self.range_m = tk.StringVar(value="30")
+        ttk.Entry(g3, textvariable=self.range_m, width=6).grid(row=2, column=1, sticky="w", padx=2)
+        ttk.Label(g3, text="(pode capturar com o caminhao PARADO no box; funciona parado)",
+                  foreground="#666").grid(row=2, column=2, columnspan=3, sticky="w", padx=4)
 
         # Anti-erro de contagem
         g4 = ttk.LabelFrame(f, text="Validacao do cruzamento")
@@ -644,6 +637,7 @@ class App(tk.Tk):
         self.g_lbl_fix = tk.StringVar(value="sem fix")
         self.g_lbl_pos = tk.StringVar(value="--, --")
         self.g_lbl_speed = tk.StringVar(value="--")
+        self.g_lbl_dist = tk.StringVar(value="--")
         self.g_lbl_bol = tk.StringVar(value="0")
         self.g_lbl_last = tk.StringVar(value="0")
         self.g_lbl_laps = tk.StringVar(value="0")
@@ -654,6 +648,8 @@ class App(tk.Tk):
         ttk.Label(g5, textvariable=self.g_lbl_pos).grid(row=0, column=3, columnspan=2, sticky="w")
         ttk.Label(g5, text="Vel (km/h):").grid(row=1, column=0, sticky="e", padx=6, pady=4)
         ttk.Label(g5, textvariable=self.g_lbl_speed).grid(row=1, column=1, sticky="w")
+        ttk.Label(g5, text="Dist. ao ponto (m):").grid(row=1, column=2, sticky="e", padx=6)
+        ttk.Label(g5, textvariable=self.g_lbl_dist, foreground="#06c").grid(row=1, column=3, sticky="w")
         ttk.Label(g5, text="Bolinhas (volta):").grid(row=2, column=0, sticky="e", padx=6, pady=4)
         ttk.Label(g5, textvariable=self.g_lbl_bol, font=big, foreground="#b00").grid(row=2, column=1, sticky="w")
         ttk.Label(g5, text="Volta anterior:").grid(row=2, column=2, sticky="e", padx=6)
@@ -692,40 +688,13 @@ class App(tk.Tk):
         a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
         return 2 * R * math.asin(math.sqrt(a))
 
-    def _perp_line(self, lat, lon, course_deg, width_m):
-        """Gera um segmento perpendicular ao rumo, centrado na posicao (A, B)."""
-        half = width_m / 2.0
-        beta = math.radians(course_deg + 90.0)     # direcao da LINHA (perp ao rumo)
-        east, north = math.sin(beta), math.cos(beta)
-        m_lat = 111320.0
-        m_lon = 111320.0 * math.cos(math.radians(lat)) or 1e-6
-        dlat = (half * north) / m_lat
-        dlon = (half * east) / m_lon
-        return (lat - dlat, lon - dlon, lat + dlat, lon + dlon)
-
-    def capture_line(self):
+    def capture_point(self):
         if not self.g_valid:
             messagebox.showwarning("GPS", "Sem sinal de GPS valido ainda.")
             return
-        try:
-            w = float(self.cap_width.get().replace(",", "."))
-        except ValueError:
-            w = 30.0
-        la1, lo1, la2, lo2 = self._perp_line(self.g_lat, self.g_lon, self.g_course, w)
-        self.lineA_lat.set("{:.6f}".format(la1)); self.lineA_lon.set("{:.6f}".format(lo1))
-        self.lineB_lat.set("{:.6f}".format(la2)); self.lineB_lon.set("{:.6f}".format(lo2))
-        self._log(">> Linha capturada em {:.6f}, {:.6f} (rumo {:.0f}).".format(
-            self.g_lat, self.g_lon, self.g_course))
-
-    def capture_point(self, which):
-        if not self.g_valid:
-            messagebox.showwarning("GPS", "Sem sinal de GPS valido ainda.")
-            return
-        if which == "A":
-            self.lineA_lat.set("{:.6f}".format(self.g_lat)); self.lineA_lon.set("{:.6f}".format(self.g_lon))
-        else:
-            self.lineB_lat.set("{:.6f}".format(self.g_lat)); self.lineB_lon.set("{:.6f}".format(self.g_lon))
-        self._log(">> Ponto {} capturado.".format(which))
+        self.point_lat.set("{:.6f}".format(self.g_lat))
+        self.point_lon.set("{:.6f}".format(self.g_lon))
+        self._log(">> Ponto capturado em {:.6f}, {:.6f}.".format(self.g_lat, self.g_lon))
 
     def gps_autodetect(self):
         if not self.g_valid:
@@ -753,39 +722,35 @@ class App(tk.Tk):
         idx = self.track_cb.current()
         if idx < 0 or idx >= len(self.tracks):
             return
-        linha = self.tracks[idx].get("linha")
-        if linha and len(linha) == 4:
-            self.lineA_lat.set("{:.6f}".format(linha[0])); self.lineA_lon.set("{:.6f}".format(linha[1]))
-            self.lineB_lat.set("{:.6f}".format(linha[2])); self.lineB_lon.set("{:.6f}".format(linha[3]))
-            self._log(">> Linha de chegada da pista carregada.")
+        ponto = self.tracks[idx].get("ponto")
+        if ponto and len(ponto) == 2:
+            self.point_lat.set("{:.6f}".format(ponto[0]))
+            self.point_lon.set("{:.6f}".format(ponto[1]))
+            self._log(">> Ponto da pista carregado.")
         else:
-            self._log(">> Esta pista ainda nao tem linha salva - capture no local.")
+            self._log(">> Esta pista ainda nao tem ponto salvo - capture no local (box).")
 
-    def save_line_to_track(self):
+    def save_point_to_track(self):
         idx = self.track_cb.current()
         if idx < 0 or idx >= len(self.tracks):
             messagebox.showwarning("Pistas", "Selecione uma pista primeiro.")
             return
-        try:
-            linha = [float(self.lineA_lat.get().replace(",", ".")),
-                     float(self.lineA_lon.get().replace(",", ".")),
-                     float(self.lineB_lat.get().replace(",", ".")),
-                     float(self.lineB_lon.get().replace(",", "."))]
-        except ValueError:
-            messagebox.showwarning("Linha", "Capture ou preencha a linha (A e B) antes de salvar.")
+        ponto = self._point_ready()
+        if not ponto:
+            messagebox.showwarning("Ponto", "Capture ou preencha o ponto (lat, lon) antes de salvar.")
             return
-        self.tracks[idx]["linha"] = linha
+        self.tracks[idx]["ponto"] = ponto
         try:
             with open(resource_path("tracks.json"), "w", encoding="utf-8") as fp:
                 json.dump({"pistas": self.tracks}, fp, ensure_ascii=False, indent=2)
-            self._log(">> Linha salva no banco para {}.".format(self.tracks[idx].get("nome", "?")))
+            self._log(">> Ponto salvo no banco para {}.".format(self.tracks[idx].get("nome", "?")))
         except Exception as e:
             messagebox.showerror("Pistas", "Nao consegui gravar tracks.json:\n{}".format(e))
 
-    def _line_ready(self):
+    def _point_ready(self):
         try:
-            return [float(v.get().replace(",", ".")) for v in
-                    (self.lineA_lat, self.lineA_lon, self.lineB_lat, self.lineB_lon)]
+            return [float(self.point_lat.get().replace(",", ".")),
+                    float(self.point_lon.get().replace(",", "."))]
         except ValueError:
             return None
 
@@ -796,16 +761,17 @@ class App(tk.Tk):
         try:
             self.link.send("GPSEN {}".format(self.gps_enable.get()))
             self.link.send("BOLIM {} {}".format(self._f(self.bolim_lambda), int(self._f(self.bolim_limit))))
-            self.link.send("BHYST {}".format(self._f(self.bolim_hyst)))
+            self.link.send("BDEB {}".format(int(self._f(self.bolim_debounce_s) * 1000)))
             self.link.send("BROW {}".format(self._row_index()))
             for idx, hexc in ((0, self.bcol_normal), (1, self.bcol_warn), (2, self.bcol_over)):
                 r, g, b = self.hex_to_rgb(hexc)
                 self.link.send("BCOL {} {} {} {}".format(idx, r, g, b))
             self.link.send("BLAP {} {}".format(int(self._f(self.min_lap_s) * 1000),
                                                int(self._f(self.min_speed))))
-            line = self._line_ready()
-            if line:
-                self.link.send("GPSLINE {:.6f} {:.6f} {:.6f} {:.6f}".format(*line))
+            self.link.send("GRANGE {}".format(int(self._f(self.range_m))))
+            ponto = self._point_ready()
+            if ponto:
+                self.link.send("GPSPT {:.6f} {:.6f}".format(*ponto))
             self.link.send("SAVE")
             self._log(">> Config do GPS enviada e gravada.")
         except ValueError:
@@ -1132,12 +1098,16 @@ class App(tk.Tk):
                     sats = int(p[2])
                     self.g_lat = float(p[3]); self.g_lon = float(p[4])
                     self.g_course = float(p[6])
-                    self.g_lbl_fix.set("OK ({} sat)".format(sats) if self.g_valid else "sem fix")
+                    self.g_lbl_fix.set("OK ({} sat)".format(sats) if self.g_valid
+                                       else "procurando... ({} sat)".format(sats))
                     self.g_lbl_pos.set("{:.6f}, {:.6f}".format(self.g_lat, self.g_lon))
                     self.g_lbl_speed.set(p[5])
                     self.g_lbl_bol.set(p[7])
                     self.g_lbl_last.set(p[8])
                     self.g_lbl_laps.set(p[9])
+                    if len(p) >= 11:
+                        d = float(p[10])
+                        self.g_lbl_dist.set("--" if d < 0 else "{:.0f}".format(d))
                 except (ValueError, IndexError):
                     pass
             return
@@ -1222,18 +1192,18 @@ class App(tk.Tk):
             try:
                 if k == "EN":
                     self.gps_enable.set(int(val))
-                elif k == "LINE":
-                    la, lo, lb, ln = val.split(",")
+                elif k == "PT":
+                    la, lo = val.split(",")
                     if abs(float(la)) > 1e-6 or abs(float(lo)) > 1e-6:
-                        self.lineA_lat.set("{:.6f}".format(float(la)))
-                        self.lineA_lon.set("{:.6f}".format(float(lo)))
-                        self.lineB_lat.set("{:.6f}".format(float(lb)))
-                        self.lineB_lon.set("{:.6f}".format(float(ln)))
+                        self.point_lat.set("{:.6f}".format(float(la)))
+                        self.point_lon.set("{:.6f}".format(float(lo)))
+                elif k == "RANGE":
+                    self.range_m.set(val)
                 elif k == "BOLIM":
                     lam, lim = val.split(",")
                     self.bolim_lambda.set(lam); self.bolim_limit.set(lim)
-                elif k == "HYST":
-                    self.bolim_hyst.set(val)
+                elif k == "DEB":
+                    self.bolim_debounce_s.set("{:g}".format(int(val) / 1000.0))
                 elif k == "ROW":
                     r = int(val)
                     self.bolim_row.set("Topo (0)" if r == 0 else

@@ -168,9 +168,10 @@ STREAM 0|1                   liga/desliga telemetria
 --- Modo prova / GPS ---
 GGET                         devolve "GCFG ..." (config do GPS)
 GPSEN 0|1                    liga/desliga o contador de bolinhas
-GPSLINE latA lonA latB lonB  linha de chegada (segmento)
+GPSPT lat lon                ponto de referencia da linha de chegada
+GRANGE metros                raio de deteccao ao redor do ponto
 BOLIM lambda limite          lambda limite da bolinha + nro p/ penalizar
-BHYST valor                  histerese p/ rearmar a contagem
+BDEB ms                      tempo de bloqueio entre bolinhas (ms) - regra: 2000
 BROW 0..7                    linha da borda reservada ao contador
 BCOL idx r g b               cor: idx 0=normal 1=atencao 2=estourado
 BLAP minLapMs minSpeedKmh    tempo min. entre voltas + velocidade minima
@@ -186,8 +187,9 @@ D <tensao> <lambda> <mediaMovel> <trend> <colMask> <alarme> <central>
      colMask: bitmask das 8 colunas acesas (bit0=col1)
      central: 1 = LED verde central aceso (em repouso)
 
-G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnt> <voltas>   (~4 Hz, só com GPS ligado)
+G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnt> <voltas> <distM>   (~4 Hz)
      valido:  1 = fix de GPS válido
+     distM:   distância atual até o ponto da linha de chegada (m); <0 = sem ponto
 ```
 
 ## 6. Corrigir LEDs invertidos / zig-zag (mapeamento)
@@ -212,15 +214,24 @@ indo”. Ajuste **sem recompilar**, pelo app (aba **Configurações → Mapeamen
 
 Conta as **bolinhas** (cada vez que a sonda passa do valor permitido pela prova) e
 mostra numa **linha da borda** do painel reservada só pra isso — o resto do painel
-continua funcionando igual. A cada **linha de chegada** cruzada (via GPS), o
+continua funcionando igual. A cada passagem pela **linha de chegada** (via GPS), o
 contador **zera** (nova volta). Tudo roda **no próprio Arduino** (funciona sem
 notebook no caminhão); o app só configura e monitora.
 
+A linha de chegada é um **ponto de referência + um raio** (padrão 30 m). Conta uma
+volta quando o **trecho percorrido** (posição anterior → atual) passa a menos do
+raio do ponto — medir pelo trecho (e não só pela posição atual) evita perder volta
+em alta velocidade. Como o raio já absorve o erro do GPS (~2,5 m), **não precisa de
+precisão**: dá pra **capturar o ponto com o caminhão parado no box** (que fica de
+frente pra linha de chegada) e usar um raio que alcance a reta — sem acessar a pista.
+
 - **Config em EEPROM separada:** ativar o GPS **não apaga** sua configuração atual
   (cores, calibração, lambdas). Se algo der errado, `LOAD` recarrega tudo.
-- **Como conta 1 bolinha:** cada **excursão** do valor de sonda além do *lambda
-  limite* (independente do alerta visual). Uma histerese evita contar a mesma
-  excursão várias vezes quando o valor treme na borda.
+- **Como conta 1 bolinha:** quando o valor de sonda passa do *lambda limite*
+  (independente do alerta visual). Ao contar uma bolinha, há um **tempo de
+  bloqueio** (padrão **2 s**, configurável) antes de contar outra — assim uma
+  mesma oscilação não vira várias bolinhas. Se continuar/voltar a estourar depois
+  desse tempo, conta de novo.
 - **No painel:** 1 LED por bolinha na linha reservada. **Verde** normal, **âmbar**
   quando falta 1 pro limite, **vermelho piscando** ao estourar (≥ limite, padrão 6).
 
@@ -228,22 +239,24 @@ notebook no caminhão); o app só configura e monitora.
 1. Marque **Ligar contador de bolinhas**.
 2. Ajuste **lambda limite**, **limite de bolinhas** (padrão 6), a **linha
    reservada** (base/topo) e as cores.
-3. Defina a **linha de chegada**:
-   - **Auto-detectar pela posição** escolhe a pista mais próxima do banco
-     (`app/tracks.json`); **ou** selecione a pista na lista; **ou**
-   - **Capturar linha aqui** (o mais preciso): pare/passe **em cima da linha** e
-     clique — ele gera o segmento perpendicular ao seu rumo (largura configurável).
-     Depois **Salvar linha nesta pista** grava no banco pra próxima vez.
+3. Defina a **linha de chegada** (ponto + raio):
+   - **Capturar ponto aqui** (recomendado): com o caminhão **parado no box** de
+     frente pra linha, clique — grava a posição atual (funciona parado). Ajuste o
+     **raio** pra alcançar a reta (padrão 30 m). Depois **Salvar ponto nesta pista**
+     grava no banco pra próxima vez; **ou**
+   - **Auto-detectar pela posição** / selecione a pista na lista (`app/tracks.json`)
+     pra puxar um ponto já salvo.
 4. **Enviar e gravar configurações do GPS**.
-5. Acompanhe **GPS ao vivo** (sinal/sats, posição, velocidade, bolinhas da volta,
-   volta anterior, nº de voltas). Botões **Zerar bolinhas / Zerar voltas**.
+5. Acompanhe **GPS ao vivo** (sinal/sats, posição, velocidade, **distância até o
+   ponto**, bolinhas da volta, volta anterior, nº de voltas). A distância ajuda a
+   calibrar o raio: veja o menor valor quando o caminhão passa pela reta.
+   Botões **Zerar bolinhas / Zerar voltas**.
 
-> **Precisão:** o NEO-6M tem ~2,5 m de erro e sai de fábrica a 1 Hz. A detecção
-> usa **cruzamento de segmento** (trecho percorrido × linha de chegada), então
-> funciona mesmo a 1 Hz, mas a **captura no local** é sempre mais confiável que as
-> coordenadas aproximadas do banco. Há filtros de **velocidade mínima** e **tempo
-> mínimo entre voltas** pra não contar volta parado no box.
+> **Precisão:** o NEO-6M tem ~2,5 m de erro e sai de fábrica a 1 Hz. Como a detecção
+> usa **ponto + raio** medido pelo trecho percorrido, funciona bem mesmo a 1 Hz e o
+> raio já absorve o erro. Há filtros de **velocidade mínima** e **tempo mínimo entre
+> voltas** pra não contar volta parado no box.
 
 > **Não existe** um banco oficial/global com a linha de chegada exata de todas as
 > pistas — por isso o banco embutido traz só pontos **aproximados** (pra
-> auto-detectar o nome) e o fluxo recomendado é **capturar a sua linha** na pista.
+> auto-detectar o nome) e o fluxo recomendado é **capturar o seu ponto** no box.

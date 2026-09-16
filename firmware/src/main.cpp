@@ -29,6 +29,10 @@
 #define ADC_VREF     5.0f     // Tensao de referencia do ADC (5V no Micro)
 // (o tipo de fiacao - serpentina/espelho/transpor - e configuravel pelo app)
 
+// GPS "pegou sinal": a partir de quantos satelites o anel azul ao redor do
+// quadrado central (em repouso) acende, indicando que o fix ja esta vindo.
+#define GPS_FIX_SATS 2        // acende com MAIS de 2 satelites (>= 3)
+
 CRGB leds[NUM_LEDS];
 
 // ---------------------------------------------------------------------
@@ -108,7 +112,7 @@ Config cfg;
 //  Modulo: GPS6MV2 / HW-248 (NEO-6M) ligado na Serial1 do Arduino Micro:
 //    TX do GPS -> D0 (RX1 do Micro)   |   VCC 5V   |   GND comum
 #define GCFG_MAGIC   0x6D
-#define GCFG_VERSION 1
+#define GCFG_VERSION 3
 #define GCFG_ADDR    400      // bem depois da Config (que fica em 0)
 
 struct GpsCfg {
@@ -117,15 +121,17 @@ struct GpsCfg {
 
   uint8_t  enable;        // 1 = liga a contagem de bolinhas + linha reservada no painel
 
-  // Linha de chegada como SEGMENTO A--B (2 pontos GPS). O cruzamento e detectado
-  // testando se o trecho percorrido (posicao anterior->atual) cruza esse segmento.
-  float    latA, lonA;
-  float    latB, lonB;
+  // Linha de chegada como PONTO + RAIO. Conta uma volta quando o trecho percorrido
+  // (posicao anterior->atual) passa a menos de 'rangeM' metros do ponto. Pratico:
+  // capture com o caminhao PARADO no box (de frente p/ a linha) e use raio ~30 m.
+  float    latP, lonP;    // ponto de referencia da linha de chegada
+  uint16_t rangeM;        // raio de deteccao em metros
 
   // "Bolinha": estouro do valor de sonda permitido pela prova. Limite SEPARADO
   // do alerta visual. Em modo diesel conta quando a media movel fica <= bolimLambda.
   float    bolimLambda;   // limite de sonda que caracteriza a bolinha
-  float    bolimHyst;     // histerese p/ rearmar (evita contar tremida na borda)
+  uint16_t bolimDebounceMs; // tempo de bloqueio (ms) apos contar: so conta outra
+                            // bolinha depois desse tempo (regra: 2 s, configuravel)
   uint8_t  bolimLimit;    // a partir deste nro de bolinhas = penalizado (ex.: 6)
 
   // Linha da borda reservada so pro contador (0 = topo ... 7 = base)
@@ -152,11 +158,13 @@ float   gPrevLat = 0.0f, gPrevLon = 0.0f;
 bool    gHasPrev = false;
 float   gSpeedKmh = 0.0f;
 float   gCourse   = 0.0f;
+float   gDistM    = -1.0f;      // distancia atual ate o ponto (m); <0 = sem ponto
 
 uint16_t bolinhas        = 0;  // bolinhas da VOLTA atual
 uint16_t lastLapBolinhas = 0;  // bolinhas da volta anterior (fechada ao cruzar)
 uint16_t lapCount        = 0;  // numero de voltas contadas
-bool     bolArmed        = true;
+bool     bolArmed        = true; // pronto p/ contar (tempo de bloqueio ja passou)
+uint32_t lastBolMs       = 0;  // millis() da ultima bolinha contada
 uint32_t lastCrossMs     = 0;  // millis() do ultimo cruzamento da linha
 uint32_t tGtelem = 0;          // timer da telemetria do GPS
 
@@ -264,11 +272,11 @@ void loadEEPROM() {
 void loadGpsDefaults() {
   gcfg.magic   = GCFG_MAGIC;
   gcfg.version = GCFG_VERSION;
-  gcfg.enable  = 0;                 // desligado ate configurar a linha de chegada
-  gcfg.latA = 0.0f; gcfg.lonA = 0.0f;
-  gcfg.latB = 0.0f; gcfg.lonB = 0.0f;
+  gcfg.enable  = 0;                 // desligado ate configurar o ponto da linha
+  gcfg.latP = 0.0f; gcfg.lonP = 0.0f;
+  gcfg.rangeM = 30;                 // raio de deteccao padrao: 30 m
   gcfg.bolimLambda = 1.33f;         // mesmo default do alarme, mas independente
-  gcfg.bolimHyst   = 0.03f;
+  gcfg.bolimDebounceMs = 2000;      // regra: 2 s de bloqueio entre bolinhas
   gcfg.bolimLimit  = 6;             // 6 ou mais = penalizado
   gcfg.bolimRow    = 7;             // linha de baixo reservada pro contador
   gcfg.nR = 0;   gcfg.nG = 255; gcfg.nB = 0;    // normal  = verde
@@ -288,10 +296,9 @@ void loadGps() {
   }
 }
 
-// A linha de chegada so vale se os dois pontos foram definidos (nao-zero)
-bool lineValid() {
-  return (gcfg.latA != 0.0f || gcfg.lonA != 0.0f) &&
-         (gcfg.latB != 0.0f || gcfg.lonB != 0.0f);
+// O ponto da linha de chegada so vale se foi definido (nao-zero)
+bool pointValid() {
+  return (gcfg.latP != 0.0f || gcfg.lonP != 0.0f);
 }
 
 // Recalcula parametros derivados quando a config muda
@@ -355,28 +362,39 @@ float nmeaToDeg(const char *f, char hemi) {
   return (float)d;
 }
 
-// Sinal do produto vetorial (b-a) x (c-a). x=lon, y=lat (planar na escala da pista)
-float cross3(float ax, float ay, float bx, float by, float cx, float cy) {
-  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+// Distancia (m) do PONTO de referencia (plat,plon) ao SEGMENTO percorrido
+// (lat1,lon1)->(lat2,lon2). Usa aproximacao planar local (equirretangular),
+// otima na escala de uma pista. Assim nao "pula" o ponto entre duas leituras.
+float distSegPointM(float lat1, float lon1, float lat2, float lon2,
+                    float plat, float plon) {
+  const float M_LAT = 111320.0f;
+  float m_lon = 111320.0f * cos(plat * 0.01745329f);   // graus->rad
+  // coordenadas em metros relativas ao ponto (origem)
+  float ax = (lon1 - plon) * m_lon, ay = (lat1 - plat) * M_LAT;
+  float bx = (lon2 - plon) * m_lon, by = (lat2 - plat) * M_LAT;
+  float dx = bx - ax, dy = by - ay;
+  float len2 = dx * dx + dy * dy;
+  float t = (len2 > 0.0f) ? -(ax * dx + ay * dy) / len2 : 0.0f;
+  if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+  float cx = ax + t * dx, cy = ay + t * dy;   // ponto mais proximo no segmento
+  return sqrt(cx * cx + cy * cy);
 }
 
-// Os segmentos P1P2 e P3P4 se cruzam?
-bool segmentsCross(float p1x, float p1y, float p2x, float p2y,
-                   float p3x, float p3y, float p4x, float p4y) {
-  float d1 = cross3(p3x, p3y, p4x, p4y, p1x, p1y);
-  float d2 = cross3(p3x, p3y, p4x, p4y, p2x, p2y);
-  float d3 = cross3(p1x, p1y, p2x, p2y, p3x, p3y);
-  float d4 = cross3(p1x, p1y, p2x, p2y, p4x, p4y);
-  return (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
-          ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)));
+// Distancia (m) de uma posicao ao ponto de referencia (p/ telemetria).
+float distToPointM(float lat, float lon) {
+  const float M_LAT = 111320.0f;
+  float m_lon = 111320.0f * cos(gcfg.latP * 0.01745329f);
+  float dx = (lon - gcfg.lonP) * m_lon, dy = (lat - gcfg.latP) * M_LAT;
+  return sqrt(dx * dx + dy * dy);
 }
 
-// Detecta o cruzamento da linha de chegada e fecha a volta (zera as bolinhas).
+// Detecta a passagem pela linha de chegada e fecha a volta (zera as bolinhas).
 void checkLapCross() {
-  if (!gcfg.enable || !gValid || !lineValid()) return;
-  if (gHasPrev && gSpeedKmh >= gcfg.minSpeed) {
-    if (segmentsCross(gPrevLon, gPrevLat, gLon, gLat,
-                      gcfg.lonA, gcfg.latA, gcfg.lonB, gcfg.latB)) {
+  if (!pointValid()) { gDistM = -1.0f; gHasPrev = false; return; }
+  gDistM = distToPointM(gLat, gLon);
+  if (gcfg.enable && gHasPrev && gSpeedKmh >= gcfg.minSpeed) {
+    float d = distSegPointM(gPrevLat, gPrevLon, gLat, gLon, gcfg.latP, gcfg.lonP);
+    if (d <= gcfg.rangeM) {
       uint32_t now = millis();
       if (now - lastCrossMs > gcfg.minLapMs) {
         lastCrossMs     = now;
@@ -452,16 +470,20 @@ void readGps() {
 }
 
 // Atualiza a contagem de bolinhas (estouro do valor de sonda permitido).
-// Uma bolinha e contada por EXCURSAO: cruzou o limite -> +1; so rearma
-// depois que a media movel volta alem da histerese.
+// Regra: ao contar uma bolinha, ha um TEMPO DE BLOQUEIO (bolimDebounceMs, ex.: 2 s)
+// antes de poder contar outra. Se a sonda continuar/voltar a estourar depois desse
+// tempo, conta de novo. Isso evita varias bolinhas seguidas pela mesma oscilacao.
 void updateBolinha() {
   if (!gcfg.enable) return;
-  bool viol  = cfg.dieselMode ? (mavg <= gcfg.bolimLambda)
-                              : (mavg >= gcfg.bolimLambda);
-  bool clear = cfg.dieselMode ? (mavg >= gcfg.bolimLambda + gcfg.bolimHyst)
-                              : (mavg <= gcfg.bolimLambda - gcfg.bolimHyst);
-  if (bolArmed && viol)        { bolinhas++; bolArmed = false; }
-  else if (!bolArmed && clear) { bolArmed = true; }
+  uint32_t now = millis();
+  bool viol = cfg.dieselMode ? (mavg <= gcfg.bolimLambda)
+                             : (mavg >= gcfg.bolimLambda);
+  if (!bolArmed && (now - lastBolMs >= gcfg.bolimDebounceMs)) bolArmed = true;
+  if (viol && bolArmed) {
+    bolinhas++;
+    bolArmed  = false;
+    lastBolMs = now;
+  }
 }
 
 // Desenha a linha da borda reservada ao contador de bolinhas (por cima de tudo).
@@ -584,6 +606,22 @@ void render() {
           leds[idx] = g;
           on[idx] = true;
         }
+
+      // Indicador "GPS pegou sinal": so enquanto o quadrado central esta aceso
+      // (painel em repouso). Com mais de GPS_FIX_SATS satelites, acende o anel
+      // 4x4 azul ao redor do centro (12 LEDs). Ao sair do centro (barra sobe),
+      // volta ao funcionamento normal. Roda independente do PC (gSats vem do GGA).
+      if (gSats > GPS_FIX_SATS) {
+        CRGB bl(0, 0, 255);                       // azul (sinal OK)
+        for (uint8_t x = 2; x <= 5; x++)
+          for (uint8_t y = 2; y <= 5; y++) {
+            if (x == 2 || x == 5 || y == 2 || y == 5) {   // so a borda do 4x4
+              uint16_t idx = XY(x, y);
+              leds[idx] = bl;
+              on[idx] = true;
+            }
+          }
+      }
     }
   }
 
@@ -668,12 +706,12 @@ void sendConfig() {
 void sendGpsConfig() {
   Serial.print(F("GCFG"));
   Serial.print(F(" EN="));   Serial.print(gcfg.enable);
-  Serial.print(F(" LINE=")); Serial.print(gcfg.latA, 6); Serial.print(',');
-  Serial.print(gcfg.lonA, 6); Serial.print(','); Serial.print(gcfg.latB, 6);
-  Serial.print(','); Serial.print(gcfg.lonB, 6);
+  Serial.print(F(" PT="));   Serial.print(gcfg.latP, 6); Serial.print(',');
+  Serial.print(gcfg.lonP, 6);
+  Serial.print(F(" RANGE=")); Serial.print(gcfg.rangeM);
   Serial.print(F(" BOLIM=")); Serial.print(gcfg.bolimLambda, 3); Serial.print(',');
   Serial.print(gcfg.bolimLimit);
-  Serial.print(F(" HYST=")); Serial.print(gcfg.bolimHyst, 3);
+  Serial.print(F(" DEB=")); Serial.print(gcfg.bolimDebounceMs);
   Serial.print(F(" ROW="));  Serial.print(gcfg.bolimRow);
   Serial.print(F(" BC0=")); Serial.print(gcfg.nR); Serial.print(',');
   Serial.print(gcfg.nG); Serial.print(','); Serial.print(gcfg.nB);
@@ -798,12 +836,15 @@ void handleLine(char *line) {
     gcfg.enable = atoi(strtok(NULL, " ")) ? 1 : 0;
     Serial.println(F("OK GPSEN"));
   }
-  else if (!strcmp(cmd, "GPSLINE")) {            // GPSLINE latA lonA latB lonB
-    gcfg.latA = atof(strtok(NULL, " "));
-    gcfg.lonA = atof(strtok(NULL, " "));
-    gcfg.latB = atof(strtok(NULL, " "));
-    gcfg.lonB = atof(strtok(NULL, " "));
-    Serial.println(F("OK GPSLINE"));
+  else if (!strcmp(cmd, "GPSPT")) {              // GPSPT lat lon  (ponto da linha)
+    gcfg.latP = atof(strtok(NULL, " "));
+    gcfg.lonP = atof(strtok(NULL, " "));
+    gHasPrev = false;                            // reinicia o rastro apos remarcar
+    Serial.println(F("OK GPSPT"));
+  }
+  else if (!strcmp(cmd, "GRANGE")) {             // GRANGE metros  (raio de deteccao)
+    gcfg.rangeM = (uint16_t)atol(strtok(NULL, " "));
+    Serial.println(F("OK GRANGE"));
   }
   else if (!strcmp(cmd, "BOLIM")) {              // BOLIM lambda limite
     gcfg.bolimLambda = atof(strtok(NULL, " "));
@@ -811,9 +852,9 @@ void handleLine(char *line) {
     if (l) gcfg.bolimLimit = (uint8_t)atoi(l);
     Serial.println(F("OK BOLIM"));
   }
-  else if (!strcmp(cmd, "BHYST")) {              // BHYST valor
-    gcfg.bolimHyst = atof(strtok(NULL, " "));
-    Serial.println(F("OK BHYST"));
+  else if (!strcmp(cmd, "BDEB")) {               // BDEB ms  (tempo de bloqueio entre bolinhas)
+    gcfg.bolimDebounceMs = (uint16_t)atol(strtok(NULL, " "));
+    Serial.println(F("OK BDEB"));
   }
   else if (!strcmp(cmd, "BROW")) {               // BROW linha(0..7)
     gcfg.bolimRow = (uint8_t)atoi(strtok(NULL, " ")) & 0x07;
@@ -879,7 +920,7 @@ void sendTelemetry() {
 }
 
 void sendGpsTelemetry() {
-  // G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnterior> <voltas>
+  // G <valido> <sats> <lat> <lon> <km/h> <rumo> <bolinhas> <voltaAnt> <voltas> <distM>
   Serial.print(F("G "));
   Serial.print(gValid ? 1 : 0);   Serial.print(' ');
   Serial.print(gSats);            Serial.print(' ');
@@ -889,7 +930,8 @@ void sendGpsTelemetry() {
   Serial.print(gCourse, 0);       Serial.print(' ');
   Serial.print(bolinhas);         Serial.print(' ');
   Serial.print(lastLapBolinhas);  Serial.print(' ');
-  Serial.println(lapCount);
+  Serial.print(lapCount);         Serial.print(' ');
+  Serial.println(gDistM, 1);      // distancia ao ponto (m); <0 = sem ponto
 }
 
 // ---------------------------------------------------------------------
@@ -942,13 +984,20 @@ void loop() {
     render();
   }
 
-  if (streaming && now - tTelem >= TELEM_MS) {
+  // IMPORTANTE (Arduino Micro / ATmega32U4): a "Serial" e USB (CDC). So enviamos
+  // telemetria quando ha um PC com a porta ABERTA e com espaco no buffer de saida.
+  // availableForWrite() retorna 0 quando nao ha host (app fechado / cabo so de
+  // energia) OU quando o buffer encheu porque ninguem esta lendo. Sem esse guard,
+  // o Serial.print BLOQUEIA o loop() esperando o buffer esvaziar (o que nunca
+  // acontece sem o app) e o painel "acende e trava". Com o guard, o painel roda
+  // 100% independente do PC.
+  if (streaming && now - tTelem >= TELEM_MS && Serial.availableForWrite() > 0) {
     tTelem = now;
     sendTelemetry();
   }
 
-  if (streaming && gcfg.enable && now - tGtelem >= 250) {
+  if (streaming && now - tGtelem >= 250 && Serial.availableForWrite() > 0) {
     tGtelem = now;
-    sendGpsTelemetry();      // telemetria do GPS/bolinhas (~4 Hz)
+    sendGpsTelemetry();      // telemetria do GPS/bolinhas (~4 Hz) quando conectado
   }
 }

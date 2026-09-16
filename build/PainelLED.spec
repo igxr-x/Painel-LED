@@ -5,7 +5,7 @@ a = Analysis(
     ['D:/Projetos/Claude/PAINEL LED/app/app.py'],
     pathex=[],
     binaries=[],
-    datas=[('D:/Projetos/Claude/PAINEL LED/app/LOGO.png', '.'), ('D:/Projetos/Claude/PAINEL LED/app/LOGO_header.png', '.'), ('D:/Projetos/Claude/PAINEL LED/app/app.ico', '.')],
+    datas=[('D:/Projetos/Claude/PAINEL LED/app/LOGO.png', '.'), ('D:/Projetos/Claude/PAINEL LED/app/LOGO_header.png', '.'), ('D:/Projetos/Claude/PAINEL LED/app/app.ico', '.'), ('D:/Projetos/Claude/PAINEL LED/app/tracks.json', '.')],
     hiddenimports=['serial.tools.list_ports'],
     hookspath=[],
     hooksconfig={},
